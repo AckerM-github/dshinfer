@@ -18,6 +18,11 @@
 # 环境变量同选项：REPO_DIR / SOURCE / BRANCH / DEPLOY_BUILD / DEPLOY_UP
 set -eo pipefail
 
+# 本脚本会 git pull 到自己：先把原始参数与自身指纹存下来，同步后若自己变了就 re-exec
+# （bash 按字节偏移继续读同一个文件，边拉边执行会读到错位的内容）
+ORIG_ARGS=("$@")
+SELF_SUM=$(sha256sum "$0" 2>/dev/null | cut -d' ' -f1 || true)
+
 REPO_DIR="${REPO_DIR:-$HOME/infer}"
 SOURCE="${SOURCE:-/mnt/d/llm/infer}"
 BRANCH="${BRANCH:-main}"
@@ -110,6 +115,17 @@ if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
   git status --porcelain | sed 's/^/    /'
 fi
 echo "  当前版本：$(git rev-parse --short HEAD) $(git log -1 --format=%s)"
+
+# 刚 pull 下来的版本里可能就包含本脚本的新实现；bash 已经按旧偏移读过一段了，
+# 继续执行会读到错位内容（实测表现为汇总行少 sudo、输出串行）。
+NEW_SELF="$REPO_DIR/scripts/wsl-deploy.sh"
+if [ -f "$NEW_SELF" ] && [ -n "$SELF_SUM" ] && [ "${DEPLOY_REEXEC:-0}" != 1 ]; then
+  NEW_SUM=$(sha256sum "$NEW_SELF" 2>/dev/null | cut -d' ' -f1 || true)
+  if [ -n "$NEW_SUM" ] && [ "$NEW_SUM" != "$SELF_SUM" ]; then
+    ok "部署脚本自身有新版本，用它重新执行一遍"
+    exec env DEPLOY_REEXEC=1 bash "$NEW_SELF" "${ORIG_ARGS[@]}"
+  fi
+fi
 
 # ---------------------------------------------------------------- 3/4 ~ 4/4 构建 + 启动
 
