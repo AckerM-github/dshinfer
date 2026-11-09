@@ -510,6 +510,8 @@ bash scripts/wsl-deploy.sh --source git@github.com:AckerM-github/dshinfer.git --
 up + 等 /healthz   → 冷启动 14 s，重建后 6 s
 全量 deploy        → recreate + 4–10 s 等到 /healthz，汇总行：代码版本 94faf5c /
                      镜像 f10d99d05a63 3 minutes ago 2.64GB / 容器 Up 4 seconds
+health 等待        → /healthz 就绪时容器常还是 (health: starting)；脚本现在轮询
+                     inspect 的 health 状态（≤30 s）后再打印，未转 healthy 则 warn
 re-exec 验证       → clone 在 94faf5c 时给 origin 造一个只改脚本的临时 commit，
                      脚本打「部署脚本自身有新版本，用它重新执行一遍」后重跑一遍，
                      最终版本为临时 commit，无死循环
