@@ -1,0 +1,391 @@
+# 在 Docker 里部署大模型（dshinfer）
+
+> 结论先说：**能，而且是业界通用做法。** 但在你这套项目里，"引擎"这个词指两个不同的东西，
+> 先分清才能判断"改动量"和"是不是主流"。
+
+## 1. 先拆清两层：谁是谁
+
+| 层 | 你的东西 | 位置 | 是不是容器里该跑的东西 |
+| --- | --- | --- | --- |
+| 服务层（网关） | `dshinfer`：FastAPI + 准入/排队/超时/取消/埋点 + OpenAI 兼容协议 | `D:\llm\infer\src\dshinfer` | 是，你自研的这一层 |
+| 推理引擎 | `llama-server.exe`（llama.cpp build 12202） | `D:\llm\runtime\llama.cpp\` | 是，被服务层当子进程拉起 |
+| 权重 | `DeepSeek-V4-Pro-Qwen3.5-9B-...Q4_K_M.gguf`（5.24 GB） | `D:\llm\models\gguf\` | 挂卷，不进镜像 |
+
+所以"infer 是 llm 的引擎"这句话要修正一下：`D:\llm\infer` 是**服务层**，
+真正的引擎是它 spawn 的 llama-server。而这个设计恰好让容器化变简单——
+`llamacpp_server.py` 本来就是把引擎当黑盒进程用，换平台只要换二进制路径，**src/ 一行不用改**。
+
+## 2. 业界到底怎么摆
+
+三种形态，业界都在用，但你得选一个：
+
+**A. 单容器：引擎 + 模型加载 + 服务在同一镜像里**（本仓库 `docker/Dockerfile` 走这条）
+- 谁在用：ollama、LocalAI、`ghcr.io/ggml-org/llama.cpp:server-cuda`、vLLM 官方镜像——**都是这个形态**。
+- 优点：一条命令起来，无网络跳转开销，调试简单，8 GB 单卡最省事。
+- 缺点：换模型/换引擎版本要重建镜像（权重挂卷就没这个问题），不能单独扩缩容。
+
+**B. 双容器：引擎容器 + 你的网关容器**（生产/k8s 主流）
+- 谁在用：vLLM/TGI/SGLang Deployment + LiteLLM / Envoy AI Gateway / Kong 做准入与多租户。
+- 优点：引擎可以独立升级、换后端（llama.cpp ↔ vLLM）、网关可水平扩、镜像与权重解耦。
+- 缺点：多一跳 HTTP（同机基本无损），你这套代码要加"外部引擎 URL"模式。
+
+**C. 权重打进镜像层**：**几乎没人这么做**（除了一些超小模型做 demo）。
+- 理由：镜像仓库不适合放 GB 级权重、每次换量化都要重推、层缓存爆炸。
+- 标准做法：`-v /models:/models:ro` 挂载，或 k8s PVC / HF cache 卷。
+
+你的项目现状 = A 直接可用；B 需要约 20 行改造（见第 6 节）。**两条路都不是野路子**，
+但"生产上一个网关 + N 个引擎实例"最终都会走到 B。
+
+## 3. 本仓库新增了什么（全部增量，不动 src/）
+
+```
+docker/Dockerfile            单容器镜像：ubuntu:24.04 + python3.12 + b12202 的 Linux CUDA 12.8 引擎
+docker/compose.yaml          GPU 预留 + 权重只读卷 + env 与 .env 逐条对齐 + healthcheck
+docker/chat_template.jinja   从 D:\llm\runtime\chat_template.jinja 复制的 8908 B 模板
+.dockerignore                构建上下文排除（上下文是仓库根）
+docs/docker.md               本文
+models/models.json           权重清单：字节数 + sha256 + 来源（权重本体不进镜像也不进 git）
+models/SHA256SUMS            校验和，`sha256sum -c` 直接可用
+scripts/fetch-model.sh       权重校验/下载工具：--check / --download / --sums / --list
+```
+
+镜像里做的 4 件关键事：
+
+1. **同 build 号换平台**：不是随便拉个 llama.cpp 镜像，而是从 release 下
+   `llama-b12202-bin-ubuntu-cuda-12.8-x64.tar.gz` + `cudart-llama-b12202-bin-ubuntu-cuda-12.8-x64.tar.gz`，
+   和你 Windows 侧 exe 完全同 build（12202 / commit d6be06557）。**这样 `docs/perf.md` 的调优数据仍然有效**，
+   否则换 build 后 PPL/吞吐对不上，等于把之前的基准清零。
+2. `DSHINFER_HOST=0.0.0.0`：默认值 127.0.0.1 在容器里会导致端口映射打不通，这是最常见的坑。
+3. 路径全部容器化：`/opt/llama/bin/llama-server`、`/models`、`/app/runtime/chat_template.jinja`、`/var/log/dshinfer`。
+4. tini 当 PID 1：容器里 `os.name != "nt"`，`_kill_stale()` 的 powershell 分支不会执行，
+   引擎是被 uvicorn 拉起的子进程——必须靠 tini 转发 SIGTERM，否则 `docker stop` 会留下孤儿进程。
+
+## 4. 跑起来的步骤（含前置检查）
+
+```powershell
+# 0) 前置：本机现在没有 docker（docker 命令 CommandNotFoundException），先装 Docker Desktop
+#    并确保 Settings → Resources → WSL Integration 勾上你的 Ubuntu 发行版
+wsl -l -v                     # 已有 Ubuntu / kali-linux，均 Stopped，Docker Desktop 会自己起 WSL
+
+# 1) 验证 GPU 在容器里可见（失败就是 nvidia-container-toolkit / 驱动层没通）
+docker run --rm --gpus all ubuntu:24.04 nvidia-smi
+
+# 2) 先停掉 Windows 侧正在跑的引擎，避免抢 8124 端口 / 占显存
+D:\llm\infer\scripts\stop.ps1
+
+# 3) 构建 + 启动
+cd D:\llm\infer
+docker compose -f docker/compose.yaml build
+docker compose -f docker/compose.yaml up -d
+docker compose -f docker/compose.yaml logs -f
+
+# 4) 冒烟
+curl http://127.0.0.1:8000/healthz
+curl http://127.0.0.1:8000/v1/models
+docker exec dshinfer nvidia-smi          # 看显存是否 6.7 GB 左右
+```
+
+**没有 Docker 也想先验证"引擎进容器"这条路**：直接跑官方镜像，你的服务留在宿主机
+（把 `.env` 里的 `DSHINFER_ENGINE` 用不上，因为服务层会自己 spawn —— 所以这条路只适合手动比对，
+不能直接复用 `LlamaServerEngine`）：
+
+```powershell
+docker run --rm --gpus all -p 127.0.0.1:8124:8124 \
+  -v D:/llm/models/gguf:/models:ro \
+  ghcr.io/ggml-org/llama.cpp:server-cuda \
+  -m /models/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q4_K_M.gguf \
+  --host 0.0.0.0 --port 8124 -c 32768 -b 2048 -ub 1024 -fa on -ngl -1 -np 4 --no-webui --metrics --kv-unified -ctk q8_0 -ctv q8_0
+```
+
+（官方镜像的 CUDA 版本是 12.8 系列，build 号与 12202 不同，只能做"能跑通"验证，不能做数值对照。）
+
+## 5. 坑清单（按踩到概率排序）
+
+| # | 坑 | 现象 | 处理 |
+| --- | --- | --- | --- |
+| 1 | `host=127.0.0.1` | 容器起来但 `curl` 连接被拒绝 | 已设 `DSHINFER_HOST=0.0.0.0`；自己改配置时别忘了 |
+| 2 | 权重从 `/mnt/d` 读（9p 文件系统） | 冷加载从 10 s 变成 30–90 s，mmap 随机读很慢 | 见下方"权重预热到卷"；或首次加载后 page cache 会缓和 |
+| 3 | WSL2 **不隔离显存** | Windows 桌面/Edge/别的容器一起抢，8 GB 卡上 ~6.7 GB 需求极易 CUDA OOM | 加载前关掉吃显存的程序；先降 `N_CTX=32768`（实测 6.1 GB） |
+| 4 | 镜像里缺 cudart | `error while loading shared libraries: libcudart.so.12` | Dockerfile 已把 cudart 包收进 `/opt/llama/lib` 并设 `LD_LIBRARY_PATH` |
+| 5 | 驱动/cudart 版本 | `CUDA driver version is insufficient` | 驱动 610.60 足够新（支持 CUDA 12.8/13.x），真报错就换 `LLAMA_CUDA=13.5` 的资产 |
+| 6 | `docker build` 拉 GitHub release 慢/超时 | 卡在 curl | 加 `--build-arg RELEASE_BASE=<镜像或内网地址>`；或预下载两个 tar.gz 用 `COPY` |
+| 7 | 忘了 `scripts/stop.ps1` | 宿主机引擎还在，显存/端口冲突 | 先停宿主，再 up；容器 `engine_port` 是容器内 8124，不是映射端口 |
+| 8 | 孤儿 llama-server | `docker stop` 后 `nvidia-smi` 还占显存 | 已用 tini + `stop_grace_period: 30s`；异常时 `docker kill` + `docker compose down` |
+| 9 | `.env` 没进镜像（故意的） | 容器里配置和宿主不一致 | 配置全部由 `docker/compose.yaml` 的 `environment` 给；改配置改 compose 或 `.env` + `env_file:` |
+
+**权重预热到 docker 卷**（解决坑 2，一次性 5.24 GB 拷贝）：
+
+```powershell
+docker volume create dshinfer-models
+docker run --rm -v dshinfer-models:/models -v D:/llm/models/gguf:/src alpine \
+  sh -c "cp /src/*.gguf /models/ && ls -lh /models"
+# 然后 compose 里把 MODELS_DIR 换成命名卷挂载：
+#   - dshinfer-models:/models:ro
+```
+
+## 6. 想改成双容器（生产形态）？约 20 行
+
+`LlamaServerEngine` 现在硬编码 `base_url="http://127.0.0.1:{engine_port}"` 并且永远自己 spawn，
+所以它**无法**指向外部引擎。最小改造：
+
+```python
+# src/dshinfer/config.py
+engine_url: str = ""        # 非空 = 外部引擎模式（双容器 / k8s）；空 = 自己 spawn（现状）
+
+# src/dshinfer/engine/llamacpp_server.py
+async def start(self) -> None:
+    if self._s.engine_url:                      # ① 外部模式：只建 client，不校验 GGUF、不 spawn
+        self._client = httpx.AsyncClient(base_url=self._s.engine_url, timeout=...)
+    else:
+        ...                                     # ② 现状：校验路径 → _kill_stale → Popen → _wait_ready
+```
+
+配套 compose（引擎和网关各自一个镜像，网关不再需要 `--gpus`、也不需要 CUDA 运行库，镜像能瘦到 ~150 MB）：
+
+```yaml
+services:
+  engine:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    command: ["-m","/models/DeepSeek-...Q4_K_M.gguf","--host","0.0.0.0","--port","8124","-c","65536",...]
+    volumes: ["dshinfer-models:/models:ro"]
+    deploy: {resources: {reservations: {devices: [{driver: nvidia, count: all, capabilities: [gpu]}]}}}
+  gateway:
+    build: {context: .., dockerfile: docker/Dockerfile.gateway}   # 不需要 /opt/llama 与 CUDA
+    environment: [DSHINFER_ENGINE_URL=http://engine:8124]
+    depends_on: [engine]
+```
+
+收益：引擎可换 vLLM/SGLang；网关可多副本；镜像从 ~1 GB（带 CUDA 运行库）降到 ~150 MB。
+代价：多一次 HTTP 跳转（同机 <1 ms），并且要接受"服务层不再自己管引擎生命周期"的语义变化
+（`_kill_stale`、`engine_start_timeout_s` 这些机制在外部模式下失效）。
+
+## 7. 显存预算（8 GB 是最紧的约束，容器不改变它）
+
+| 项 | 64K + q8_0 KV（现状） | 32K + q8_0 KV（保底） |
+| --- | --- | --- |
+| 权重 Q4_K_M | 5.24 GB | 5.24 GB |
+| KV cache（np=4, kv_unified） | ~1.0 GB | ~0.5 GB |
+| CUDA context / cublas workspace | ~0.3–0.5 GB | ~0.3–0.5 GB |
+| **合计（Windows 实测 `nvidia-smi`）** | **6,727 / 8,188 MiB** | **~6.1 GB** |
+| Windows 桌面/浏览器占用 | 0.5–1.2 GB（不可控） | 同上 |
+
+结论：**64K 在裸机实测能跑，但容器化后余量并没有变多**，第一次上容器建议
+`DSHINFER_N_CTX=32768` 跑通，再往上加。真要长期 64K，考虑换 `Q3_K_M`（4.31 GB）。
+
+## 8. 验收清单
+
+- [ ] `docker run --rm --gpus all ubuntu:24.04 nvidia-smi` 能看到 4060 Laptop
+- [ ] `/healthz` 返回 `{"status":"ok",...}`，且 `engine` 字段到最后是 ready（不是 loading）
+- [ ] `/v1/chat/completions` 流式能出字，首 token 时间与裸机同量级（差 <100 ms）
+- [ ] `docker exec dshinfer nvidia-smi` 显存 ≈ 6.7 GB（64K）或 ≈ 6.1 GB（32K）
+- [ ] 对照压测：改 `scripts/bench_load.py` 的 `SERVICE`/`ENGINE` 常量指向容器端口，
+      与 `docs/perf.md` 的 1/2/4/8 并发档位逐项比
+- [ ] `docker compose down` 后宿主机 `nvidia-smi` 不残留 llama-server
+
+## 9. 没验证的部分（照实说）
+
+- 本机**没有 Docker**，以上镜像与 compose 均**未实际构建运行过**（WSL2 路线见第 10 节，环境已实测）——是按你的代码与
+  llama.cpp b12202 发布资产写出来的，第一次 `build` 可能需要微调下载 URL 或库路径。
+- llama.cpp 的 `ubuntu-cuda-*` 资产内部目录结构随发布变动，Dockerfile 用 `find` 定位
+  `llama-server` 后摊平，仍建议首次构建后 `docker run --rm dshinfer:local ls -l /opt/llama/bin` 确认。
+- WSL2 + Docker Desktop 下 8 GB 卡的实际可用显存，比你 `nvidia-smi` 看到的更少（桌面合成器要占），
+  这是本项目最大的不确定项。
+- 未测试多卡、未测试 `--no-mmap`（`LlamaServerEngine` 目前不传这个参数，权重走 9p 时值得加）。
+
+## 10. 走 WSL2（本机已实测：可行，且是这台机器唯一现实路径）
+
+### 10.1 本机实测环境
+
+| 项 | 实测值 | 结论 |
+| --- | --- | --- |
+| WSL 版本 | 3.0.3.0，内核 6.18.54.1-microsoft-standard-WSL2 | 足够新，支持 `networkingMode=mirrored` |
+| 发行版 | Ubuntu 26.04.1 LTS (resolute)，WSL2，PID 1 = systemd | `/etc/wsl.conf` 里 `systemd=true` 已开，dockerd 能当服务管 |
+| 用户 | `linc`，**免密 sudo** | 装 docker 一条 apt 就够 |
+| 磁盘 | `/dev/sdd` 1007 GB，已用 3.9 GB，**剩 952 GB**（ext4） | 权重和镜像放这里 |
+| 内存 | **7.5 GiB + 2 GiB swap**（宿主机 15.5 GiB 的一半） | 5.24 GB 模型塞得下，但偏紧，建议调 `.wslconfig` |
+| GPU 直通 | `/dev/dxg` 存在；`/usr/lib/wsl/lib/libcuda.so.1` 存在；`nvidia-smi` 看到 RTX 4060 Laptop 8188 MiB / driver 610.60 / 当前占用 0 MiB | **最难的一步已经通了** |
+| docker | 未安装（无 docker / dockerd，也没有 Docker Desktop） | 但 `docker.io 29.1.3` + `docker-compose-v2 2.40.3` 就在已配好的阿里云源里 |
+| 出网 | WSL 内直连 archive.ubuntu.com 200、github.com 200（~0.8 s） | 不用代理也能下 release；Windows 侧 127.0.0.1:7890 的 Clash 在 NAT 模式下**不会**被 WSL 继承（就是启动时那条 warning） |
+
+### 10.2 装 docker：别装 Docker Desktop
+
+WSL 里原生跑一个 dockerd 就够，少一层 LinuxKit 虚拟机、GPU 链路更短，也不占 Windows 侧资源：
+
+```bash
+sudo apt update
+sudo apt install -y docker.io docker-compose-v2
+sudo systemctl enable --now docker
+docker run --rm hello-world
+sudo usermod -aG docker $USER   # 之后重开 shell 可免 sudo（不必须）
+```
+
+### 10.3 GPU 进容器：用 /dev/dxg 直通，不用 --gpus all
+
+26.04 源里没有 `nvidia-container-toolkit`（`apt-cache search nvidia-container` 为空，NVIDIA 源只挂到 24.04 noble），
+所以标准 `--gpus all` 开箱不可用。WSL2 的 GPU 通路本来就是 `/dev/dxg` + 宿主 `/usr/lib/wsl`，
+手工塞进容器效果等同（**必须挂整个 `/usr/lib/wsl`**：只挂 `lib/` 时 `nvidia-smi` 报
+`couldn't communicate with the NVIDIA driver`，因为 NVML 还要读 `/usr/lib/wsl/drivers` 里的 Store 驱动副本）：
+
+```bash
+docker run --rm \
+  --device /dev/dxg \
+  -v /usr/lib/wsl:/usr/lib/wsl:ro \
+  -e LD_LIBRARY_PATH=/usr/lib/wsl/lib \
+  nvidia/cuda:12.8.0-base-ubuntu24.04 /usr/lib/wsl/lib/nvidia-smi -L
+# 实测输出：GPU 0: NVIDIA GeForce RTX 4060 Laptop GPU (UUID: GPU-95e260be-...)
+```
+
+本仓库已经备好覆盖层 [docker/compose.wsl.yaml](compose.wsl.yaml)（清掉 nvidia 设备预留、加 /dev/dxg 与 wsl libs、权重指向 ext4）：
+
+```bash
+cp -r /mnt/d/llm/infer ~/infer && cd ~/infer
+docker compose -f docker/compose.yaml -f docker/compose.wsl.yaml build
+docker compose -f docker/compose.yaml -f docker/compose.wsl.yaml up -d
+```
+
+> `deploy: !reset null` 需要 Compose >= 2.24（26.04 源里是 2.40.3）。若你的版本不支持，
+> 就把 `docker/compose.yaml` 里的 `deploy:` 整段注释掉再叠这个文件。
+
+### 10.4 权重必须放 ext4，不要挂 /mnt/d
+
+`/mnt/d` 是 9p，mmap 随机读慢 5–10 倍（第 5 节坑 2）。952 GB 空间足够：
+
+```bash
+mkdir -p /home/linc/models
+cp /mnt/d/llm/models/gguf/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q4_K_M.gguf /home/linc/models/
+# 可选：Q3_K_M 也拷一份（4.31 GB），64K 上下文爆显存时用
+```
+
+### 10.5 .wslconfig（可选，建议）
+
+宿主 15.5 GiB，WSL 默认只给一半；5.24 GB 权重经 page cache 走 mmap，7.5 GiB 会紧张：
+
+```ini
+# C:\Users\74185\.wslconfig（当前不存在）
+[wsl2]
+memory=10GB
+swap=8GB
+autoMemoryReclaim=gradual
+# 让 WSL 也能用 Windows 侧 127.0.0.1:7890 的 Clash（那条 localhost 代理 warning 会消失）
+networkingMode=mirrored
+```
+
+改完 `wsl --shutdown` 生效。注意 `memory` 只管 **RAM**，**不管显存**——8 GB 显存全系统共享，
+Windows 桌面/浏览器随时能把它吃掉一部分（实测这一分钟是 0 MiB 占用，是测 64K 的好时机）。
+
+### 10.6 建议按这个顺序动手
+
+1. `sudo apt install -y docker.io docker-compose-v2` → `docker run --rm hello-world`
+2. 验证 GPU 直通：上面那条 `nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi`，要看到 4060 Laptop
+3. 拷权重到 `/home/linc/models`、拷仓库到 `~/infer`
+4. `docker compose -f docker/compose.yaml -f docker/compose.wsl.yaml build`（首次下 188 MB + 594 MB）
+5. **先用 `DSHINFER_N_CTX=32768` 跑通**，再试 65536
+6. `curl http://127.0.0.1:8000/healthz` + `docker exec dshinfer nvidia-smi` 对显存
+
+---
+
+## 11. WSL2 实测结果（2026-11-09，容器已跑通）
+
+实测环境：Ubuntu 26.04.1 LTS / WSL 3.0.3 / 内核 6.18.54.1-microsoft-standard-WSL2、
+docker.io 29.1.3、容器内 llama.cpp build 12202 (CUDA 12.8)、RTX 4060 Laptop 8188 MiB、
+权重 Q4_K_M、KV 全 q8_0、-fa on、-ngl -1。
+
+### 11.1 镜像、加载、显存
+
+| 项 | 实测值 |
+|---|---|
+| 镜像 | `dshinfer:local`，2.64 GB（disk）/ 1.04 GB（content） |
+| 构建耗时 | 首次约 6 分钟（含下载 188 MB 引擎包 + 594 MB cudart） |
+| 引擎冷加载 | 22.3 s（`/healthz` 里 `load_seconds`） |
+| 显存 @ 64K | 6,181 / 8,188 MiB |
+| 显存 @ 32K | 6,001 MiB |
+| 显存 @ 8K | 5,497 MiB |
+| 权重体积 | 5.24 GB GGUF，mmap 自 `/models`（ext4 卷） |
+
+### 11.2 速度：容器代价只有 3–5%，真正的坑是上下文长度
+
+容器内直接跑 `llama-bench`（与 docs/perf.md 第 2 节同命令、同参数）：
+
+| 测试 | 容器内实测 | Windows 原生（perf.md） | 差 |
+|---|---|---|---|
+| pp512 | 2,077–2,337 t/s | 2,399 | −3% ～ −13% |
+| tg128 | 41.3–42.5 t/s | 43.45 | −2% ～ −5% |
+
+注意：**同一份二进制在容器里就能跑到 41+ t/s**，所以 WSL + 容器 + /dev/dxg 这条通路本身没有显著损失。
+
+但把 `llama-server` 按生产参数起起来，单流生成速度是这样的（同一镜像、同一权重、`-np 4 --kv-unified -ctk/-ctv q8_0 -fa on`）：
+
+| `-c` 上下文 | 单流生成 | 显存 |
+|---|---|---|
+| 8,192 | 39.3 t/s | 5,497 MiB |
+| 16,384 | 40.1 t/s | 5,649 MiB |
+| 32,768 | **40.4 t/s** | 6,001 MiB |
+| 65,536 | **26.3 t/s** | 6,183 MiB |
+
+读法：
+- 8K～32K 之间速度基本平（都 ≈ 40 t/s，和 bench 的 41–42 一致），**32K 是免费的**；
+- 一步跨到 64K，生成速度掉 35%（40.4 → 26.3），因为 64K 的 KV 让每步的读取量和图尺寸都上了一个台阶；
+- 这不是容器造成的：perf.md 里 43 t/s 那组数字是 `llama-bench` 在默认小上下文下测的，换成 64K 的 server 在原生 Windows 上同样会掉。
+- `-np`（slot 数）在 kv_unified 下**不花钱**：`-np 1` 与 `-np 4` 实测 26.24 与 26.30 t/s，64K 的代价与 slot 数无关。
+- 64K 下换 f16 KV：20.5 t/s（更慢）；`-fa off` + 64K 直接 `failed to create context`（OOM）→ **q8_0 KV + FA 是 8 GB 上跑 64K 的唯一可行组合**。
+
+### 11.3 那条 Flash Attention 警告怎么读
+
+引擎日志里会出现：
+
+```
+W resolve_fused_ops: layer 3 is assigned to device CPU but Flash Attention over K/V rows
+  is assigned to device CUDA0 (usually due to missing support)
+W resolve_fused_ops: Flash Attention over K/V rows not supported, set to disabled
+```
+
+这是 build 12202 的 **fused-op 选择器**关掉了「FA over K/V rows」这一个融合算子，不是把 FA 整个关掉。
+证据：64K + `-fa off` 直接 OOM，而 `-fa on` 能跑；16K/32K 下速度与 bench 的 `-fa 1` 相当。
+结论：可以忽略，别为它去改参数。
+
+### 11.4 WSL 会被自动关机：容器会「假死」
+
+最后一个 `wsl.exe` 会话退出后约 30 秒，WSL 会关掉整个发行版（systemd 日志里是
+`systemd-logind: The system will power off now!`），于是 dockerd 停、容器停。
+下次任何 `wsl.exe` 命令会把发行版重新拉起，`docker.service`（`Restart=always`）
+和容器（`restart: unless-stopped`）都会自动恢复，**但权重要重新加载 22 s**，
+这段时间 `curl /healthz` 会连不上（我刚踩过：第一发冒烟测试就撞在重启窗口里，ConnectionResetError）。
+
+要让它常驻，二选一：
+
+```powershell
+# A. 留一个会话挂着（最简单）
+wsl.exe -d Ubuntu -- bash -lc "exec sleep infinity"
+```
+
+```ini
+# B. C:\Users\<你>\.wslconfig
+[wsl2]
+vmIdleTimeout=86400000   # 24h 不自动关机（毫秒）
+```
+
+判断「现在是不是真的在跑」：`docker ps` 看到 `Up ... (healthy)` 且
+`curl 127.0.0.1:8000/healthz` 返回 `"ready": true`。
+
+### 11.5 8 GB 上的推荐配置（已写进 compose.wsl.yaml）
+
+```yaml
+environment:
+  DSHINFER_N_CTX: "32768"   # 32K：40 t/s，显存 6.0 GB，留 2 GB 给 Windows 桌面
+```
+
+确实需要长上下文时再切 65536，代价是生成速度 −35%：
+
+```bash
+DSHINFER_N_CTX=65536 docker compose -f docker/compose.yaml -f docker/compose.wsl.yaml up -d --force-recreate
+```
+
+### 11.6 冒烟结果（32K/64K 都通过）
+
+```
+TTFT 0.88 s / 首字到 40 token 用时 2.35 s（64K 配置）
+中文解释：语义正确；代码题：缩进正确、可直接运行
+/v1/models 同时列出 Q4_K_M（loaded）与 Q3_K_M（not loaded）
+```
+
+

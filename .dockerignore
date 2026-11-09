@@ -1,0 +1,17 @@
+# docker build 上下文排除（上下文是仓库根，见 docker/compose.yaml 的 context: ..）
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.gitignore
+.env
+*.log
+eval/results/
+docker/*.md
+docker/compose.yaml
+docs/
+tests/
+# 权重不进构建上下文（模型靠挂卷）；models/ 里只有清单，镜像也不需要
+models/
+*.gguf

@@ -1,0 +1,86 @@
+# dshinfer —— 单容器部署（服务层 + llama.cpp 引擎同容器）
+#
+#   docker compose -f docker/compose.yaml build
+#   docker compose -f docker/compose.yaml up -d
+#   curl http://127.0.0.1:8000/healthz
+#
+# 前置：Docker Desktop（WSL2 后端）或 Linux + nvidia-container-toolkit，
+#       并且下面 GPU 段能被识别：docker run --rm --gpus all ubuntu nvidia-smi
+name: dshinfer
+
+services:
+  infer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        # 与 Windows 侧 D:\llm\runtime\llama.cpp 保持同一个 build，才能对着旧基准数据比
+        LLAMA_BUILD: "12202"
+        LLAMA_CUDA: "12.8"
+    image: dshinfer:local
+    container_name: dshinfer
+    restart: unless-stopped
+    # 引擎是 uvicorn 的子进程，给足优雅退出时间（uvicorn graceful shutdown 10 s + 引擎 kill）
+    stop_grace_period: 30s
+
+    ports:
+      # 只监听本机，避免把没鉴权的 OpenAI 兼容接口暴露到局域网；要外部访问改成 "8000:8000"
+      - "127.0.0.1:8000:8000"
+
+    volumes:
+      # 权重永远不进镜像层：5.24 GB，且实验期会换 Q4_K_M / Q3_K_M
+      # 注意 Windows 路径经 WSL2 走 9p（/mnt/d），mmap 冷加载会明显变慢，详见 docs/docker.md
+      - "${MODELS_DIR:-D:/llm/models/gguf}:/models:ro"
+      # 引擎日志（llama-server 的 stdout/stderr 落这里）
+      - dshinfer-logs:/var/log/dshinfer
+
+    environment:
+      # —— 与 D:\llm\infer\.env 逐条对齐，容器内路径换成 /models ——
+      DSHINFER_ENGINE: llamacpp
+      DSHINFER_MODELS_DIR: /models
+      DSHINFER_GGUF_PATH: /models/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q4_K_M.gguf
+      DSHINFER_LLAMA_SERVER_PATH: /opt/llama/bin/llama-server
+      DSHINFER_CHAT_TEMPLATE_PATH: /app/runtime/chat_template.jinja
+      DSHINFER_ENGINE_LOG_PATH: /var/log/dshinfer/llama-server.log
+      DSHINFER_HOST: 0.0.0.0
+      DSHINFER_PORT: "8000"
+      # 64K 上下文 + q8_0 KV：本机实测 6,727 MiB / 8,188 MiB，容器里没有额外余量，
+      # 若 OOM 先把 N_CTX 降到 32768（或换 Q3_K_M）
+      DSHINFER_N_CTX: "65536"
+      DSHINFER_CACHE_TYPE_K: q8_0
+      DSHINFER_CACHE_TYPE_V: q8_0
+      DSHINFER_N_PARALLEL: "4"
+      DSHINFER_MAX_CONCURRENCY: "4"
+      DSHINFER_KV_UNIFIED: "true"
+      DSHINFER_N_BATCH: "2048"
+      DSHINFER_N_UBATCH: "1024"
+      DSHINFER_FLASH_ATTN: "true"
+      DSHINFER_SLOT_PINNING: "true"
+      DSHINFER_N_GPU_LAYERS: "-1"
+      DSHINFER_ENGINE_START_TIMEOUT_S: "300"
+      DSHINFER_ENABLE_THINKING: "false"
+
+    # —— GPU —— 
+    # compose v2 会识别 deploy.resources.reservations.devices（不需要 swarm）
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Compose >= 2.30 也可以直接写一行：gpus: all
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 240s
+
+volumes:
+  dshinfer-logs:
+
+# 想看模型是否真的吃满显存：docker exec dshinfer nvidia-smi
+# 想直连引擎做对照压测：compose 里再暴露引擎端口（默认只绑 127.0.0.1:8124，容器内），
+# 加一行 "127.0.0.1:8124:8124" 即可，然后改 scripts/bench_load.py 的 ENGINE 常量。

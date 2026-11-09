@@ -1,0 +1,32 @@
+# WSL2 覆盖层：本机（Ubuntu 26.04 / WSL 3.0.3 / 无 nvidia-container-toolkit）用法
+#
+#   cp -r /mnt/d/llm/infer ~/infer && cd ~/infer
+#   docker compose -f docker/compose.yaml -f docker/compose.wsl.yaml build
+#   docker compose -f docker/compose.yaml -f docker/compose.wsl.yaml up -d
+#
+# 为什么不用 --gpus all：Ubuntu 26.04 源里没有 nvidia-container-toolkit（NVIDIA 官方源只到 24.04 noble）。
+# WSL2 的 GPU 通路本质是 /dev/dxg + 宿主的 /usr/lib/wsl/lib/libcuda.so.1，手工塞进容器即可。
+name: dshinfer
+
+services:
+  infer:
+    # 基础文件里的 nvidia 设备预留在这里没有意义，直接清掉（Compose >= 2.24 的 !reset）
+    deploy: !reset null
+
+    devices:
+      - /dev/dxg:/dev/dxg
+
+    volumes:
+      # 挂整个 /usr/lib/wsl，不要只挂 lib/：只挂 lib/ 时 nvidia-smi 会报
+      # "NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver"，
+      # NVML/libcuda 还需要 /usr/lib/wsl/drivers（Store 驱动副本）。实测全挂才通。
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+      # 权重放 WSL 的 ext4（/mnt/d 是 9p，mmap 慢 5–10 倍）
+      - ${MODELS_DIR:-/home/linc/models}:/models:ro
+
+    environment:
+      LD_LIBRARY_PATH: /usr/lib/wsl/lib:/opt/llama/bin:/opt/llama/lib
+      # 8 GB 显存上的最优解（docs/docker.md 11.2 实测）：32K 上下文 = 40.4 t/s、显存 6.0 GB；
+      # 拉到 64K 后生成速度掉到 26.3 t/s。要长上下文就直接改这里或
+      # DSHINFER_N_CTX=65536 docker compose ... up -d
+      DSHINFER_N_CTX: "32768"
