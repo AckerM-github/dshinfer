@@ -493,6 +493,13 @@ bash scripts/wsl-deploy.sh --source git@github.com:AckerM-github/dshinfer.git --
    于是输出变成「镜像 ：」换行「未知」；排查这类空行先想权限。
 4. 每次 deploy 都是 `ops.sh up --build`；镜像重建后 compose 会 recreate 容器（重载权重 5–15 s）。
    只想重启进程用 `bash docker/ops.sh restart`，别用 deploy。
+5. **脚本拉到自己的新版本必须 re-exec** —— 这是实测踩出来的：`git pull` 把 `wsl-deploy.sh`
+   本身换掉以后，bash 仍按旧文件的字节偏移往下读，读到的是错位内容（表现为汇总行没有 sudo、
+   输出串行成「镜像 ：」+「未知」）。脚本现在开头记下 `$0` 的 sha256 和 argv，同步完发现
+   自己变了就 `exec env DEPLOY_REEXEC=1` 用新版本重跑一遍（`DEPLOY_REEXEC` 防死循环）。
+6. **`docker image inspect --format` 的字段名**：`{{.CreatedSince}}` 对 image 不合法
+   （那是 `docker images`/`docker ps` 的字段），模板报错又正好被 `2>/dev/null` 吃掉，
+   于是这一行空着。改用 `docker images --format '{{.ID}} {{.CreatedSince}} {{.Size}}'`。
 
 ### 13.4 实测（2026-11-09，Ubuntu 26.04 / docker 29.1.3）
 
@@ -501,6 +508,11 @@ bash scripts/wsl-deploy.sh --source git@github.com:AckerM-github/dshinfer.git --
 再跑一次            → Already up to date / 已是最新（幂等）
 首次 build         → pip 层重建 59 s（.dockerignore 变过、缓存失效），之后基本全 CACHED
 up + 等 /healthz   → 冷启动 14 s，重建后 6 s
+全量 deploy        → recreate + 4–10 s 等到 /healthz，汇总行：代码版本 94faf5c /
+                     镜像 f10d99d05a63 3 minutes ago 2.64GB / 容器 Up 4 seconds
+re-exec 验证       → clone 在 94faf5c 时给 origin 造一个只改脚本的临时 commit，
+                     脚本打「部署脚本自身有新版本，用它重新执行一遍」后重跑一遍，
+                     最终版本为临时 commit，无死循环
 ```
 
 
