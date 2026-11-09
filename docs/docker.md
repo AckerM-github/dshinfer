@@ -517,5 +517,154 @@ re-exec 验证       → clone 在 94faf5c 时给 origin 造一个只改脚本�
                      最终版本为临时 commit，无死循环
 ```
 
+## 14. 内置监控面板：/dashboard
+
+### 14.1 打开方式
+
+容器已经把 8000 发布到宿主，Windows 浏览器直接开（不用进 WSL）：
+
+```
+http://127.0.0.1:8000/dashboard        # 页面本身，约 14 KB，零外部依赖
+http://127.0.0.1:8000/admin/live       # 页面每 2 s 拉一次的快照 JSON，约 1.6 KB
+```
+
+两个路由都 `include_in_schema=False`，不会出现在 OpenAPI 文档里。
+
+页面内容：
+
+| 区域 | 内容 |
+| --- | --- |
+| 顶部 | 模型名、引擎本轮 n_ctx（悬停看模型上限 65,536）、引擎类型、服务已运行时长、就绪圆点 |
+| 四个大卡 | 生成速度（单条 tok/s + 聚合 + 均值）、显存 used/total 进度条、GPU 利用率/温度/功耗/带宽、并发（在飞 + 排队/上限 + 引擎 processing/deferred） |
+| 四条曲线 | 生成速度、显存、GPU 利用率、并发，每 2 s 一点，浏览器内存里留 120 点 ≈ 4 分钟 |
+| 延迟表 | TTFT / 端到端 / 排队等待 的 p50、p95、均值、样本数（直方图桶内线性插值） |
+| 累计表 | 服务层请求数与状态码、服务层令牌（输入/输出/命中缓存）、引擎 prompt 令牌与缓存命中率、调度事件 |
+| 引擎表 | llama-server 的 7 个累计计数器（含投机解码草稿/接受） |
+| 最近请求 | `/admin/traces?limit=8`：队列等待、TTFT、decode、总耗时、状态 |
+
+### 14.2 三路数据源
+
+| 来源 | 拿法 | 用途 |
+| --- | --- | --- |
+| 本进程 Prometheus registry | `metrics.REGISTRY.collect()`（`src/dshinfer/dashboard.py` 的 `service_metrics`） | 请求数/状态码/令牌/在飞/排队/调度事件，以及 TTFT、端到端、排队三个 Histogram 的分位数 |
+| llama-server `/metrics` | `urllib` 抓 `http://127.0.0.1:8124/metrics` 后按文本解析（`engine_metrics`） | 引擎侧 prompt/生成令牌、processing/deferred、n_busy_slots |
+| NVML | `ctypes.CDLL("libnvidia-ml.so.1")`（`gpu_info`） | 显存 used/total、GPU 利用率、显存带宽利用率、温度、功耗 |
+
+引擎那 15 个指标全部带 `llamacpp:` 前缀，例如 `llamacpp:tokens_predicted_total` ——
+冒号不是合法的 Prometheus 指标名，Prometheus 抓不了，所以这里自己按行解析。
+
+### 14.3 /admin/live 的字段（实测 1,588 字节）
+
+```json
+{
+  "ts": 1794240632.853, "uptime_s": 94.1,
+  "model": {"id": "deepseek-v4-pro-qwen3.5-9b", "context_tokens": 32768,
+            "max_context_tokens": 65536, "engine": "llamacpp",
+            "max_concurrency": 4, "queue_limit": 64},
+  "health": {"engine": "llama-server", "loading": false, "last_error": null,
+             "load_seconds": 9.69, "ready": true, "upstream": {"status": "ok"}},
+  "gpu": {"name": "NVIDIA GeForce RTX 4060 Laptop GPU", "total_mib": 8188.0,
+          "used_mib": 6246.6, "free_mib": 1941.4, "util_pct": 64, "mem_util_pct": 68,
+          "temp_c": 67, "power_w": 69.0, "power_limit_w": 110.0},
+  "engine_metrics": {"tokens_predicted_total": 5236, "prompt_tokens_total": 1110},
+  "engine_rate": {"instant": 24.8, "window": 28.23, "aggregate": 64.76},
+  "service": {"inflight": 4.0, "queued": 0.0, "requests_total": 28.0,
+              "requests_by_status": {"ok": 28.0},
+              "tokens": {"input": 962.0, "output": 2649.0, "cached": 0.0},
+              "scheduler_events": {"enqueue": 32.0, "dispatch": 32.0},
+              "histograms": {"dshinfer_ttft_seconds": {"count": 30.0, "mean_s": 1.242,
+                                                      "p50_s": 1.389, "p95_s": 3.875}}}
+}
+```
+
+`engine_rate` 是服务端按引擎计数器算出来的三个速度（都是 tok/s）：
+
+- `instant`：`Δtokens / Δ(引擎累计生成秒数)`，单条请求的 decode 速度（≈ llama-bench 的 tg）；
+- `window`：上面那个值的 EWMA（0.6 权重），给大卡显示用；
+- `aggregate`：`Δtokens / Δ墙钟`，整个服务的聚合吞吐，并发时这才是"显卡在产出多少"。
+
+两个分母都要求最小采样间隔（墙钟 0.5 s、生成时间 0.1 s），太近就沿用上一次 ——
+否则用脚本或截图工具在毫秒内连打十几次快照时，令牌数几乎不变，会差分出 0 或离谱的峰。
+
+### 14.4 为什么不用 Prometheus + Grafana
+
+- 这套要多常驻 300–500 MB 内存（Prometheus 200–300 MB + Grafana 150–200 MB），
+  还多两个容器；而 WSL 只有 7.5 GB 内存，显存也只剩 2 GB。
+- 数据源全在同一台机器、同一个进程/容器里，抓取周期 2 s，不值得为它引入时序库。
+- 面板页面 14 KB、只用标准库（`ctypes` / `urllib` / `threading`），镜像不增加任何依赖。
+- 代价是没有历史留存：曲线只活在浏览器内存里（120 点 ≈ 4 分钟），刷新即清。
+  真要长期留存或告警，再上 Prometheus 抓 `/metrics`（本服务的指标名是合法的）。
+
+### 14.5 NVML 在 WSL 容器里怎么读
+
+容器里**没有** `nvidia-smi` 二进制（镜像没装，也没装 nvidia-container-toolkit），
+但 compose 把整个 `/usr/lib/wsl` 挂进来了，宿主驱动库就在
+`/usr/lib/wsl/lib/libnvidia-ml.so.1`，直接 ctypes 打开即可：
+
+```python
+lib = ctypes.CDLL("/usr/lib/wsl/lib/libnvidia-ml.so.1")
+lib.nvmlInit_v2()
+lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(handle))
+lib.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(mem))          # total / free / used（字节）
+lib.nvmlDeviceGetUtilizationRates(handle, ctypes.byref(rates))  # gpu% / memory%
+lib.nvmlDeviceGetTemperature(handle, 0, ctypes.byref(t))        # 0 = NVML_TEMPERATURE_GPU
+lib.nvmlDeviceGetPowerUsage(handle, ctypes.byref(mw))           # 毫瓦
+```
+
+代码里按 `/usr/lib/wsl/lib` → `/usr/lib/x86_64-linux-gnu` → `/usr/local/nvidia/lib64`
+→ `libnvidia-ml.so.1` → `libnvidia-ml.so` 顺序探测，全都打不开就降级成 `null`
+（原生 Windows 跑 `uv run` 时面板照样能用，只是 GPU 卡片显示"—"）。
+
+### 14.6 实测（2026-11-10，32K 配置，容器 dshinfer）
+
+4 并发持续压测（4 线程各发 `max_tokens=160`，连续跑 150 s）：
+
+| 指标 | 值 |
+| --- | --- |
+| 单条 decode 速度（`engine_rate.window`） | 28–34 tok/s |
+| 聚合吞吐（`engine_rate.aggregate`） | 52–68 tok/s（手算 1,017 tok / 15 s = 67.8） |
+| `n_busy_slots_per_decode` | 3.44–3.54（4 个 slot 基本都在忙） |
+| GPU | 利用率 44–91%、带宽 68%、62–74 °C、69–110 W |
+| 显存 | 6,245–6,247 / 8,188 MiB |
+| 服务层 TTFT | p50 1.39 s / p95 3.88 s / 均值 1.24 s（样本 30） |
+| 服务层端到端 | p50 3.50 s / p95 6.50 s |
+| 排队等待 | p50 3 ms（`MAX_CONCURRENCY=4`，第 5 条才开始排） |
+
+对照：空闲时 0 tok/s、显存 6,231 MiB、GPU 0–2%、2.7 W；单流 12 次请求的 TTFT p50 是
+0.28 s —— 4 并发时 TTFT 涨到 1.4 s，是 batching 的代价（4 条一起 decode，首字要等
+一个 batch 步进），不是服务层的问题。
+
+NVML 的 `util_pct` 在 WSL 下偶尔会在满负载的采样点读到 0（实测 0%、44%、64%、83%、91%
+都出现过），所以 GPU 卡片同时显示"带宽利用率"，那个更稳定。
+
+### 14.7 踩过的坑
+
+1. **容器里跑的不是 `/app/src`**：镜像是 `pip install .` 装到
+   `/opt/venv/lib/python3.12/site-packages/dshinfer`。改 `/app/src` 不生效
+   （第一次加 `/admin/live` 就吃了 404）。快速迭代用
+   `docker cp dashboard.py dshinfer:/opt/venv/lib/python3.12/site-packages/dshinfer/`
+   + `docker restart`，正式验证走 `bash docker/ops.sh up --build`。
+2. **`docker exec` 不加 `-i` 不接 stdin**：heredoc 形式的脚本会被静默忽略、什么都不执行，
+   表现为"命令成功但没输出、也没效果"。
+3. **llama-server 的 `predicted_tokens_seconds` / `prompt_tokens_seconds` 是采样 gauge**：
+   空闲、刚切 slot、以及 4 并发下都会读到 0。别拿它当主数字，要用计数器差分 + 计数器均值。
+4. **`/healthz` 的 `engine` 字段是字符串**（`"llama-server"`），`ready` 与它同级；
+   前端写成 `health.engine.ready` 就永远是"引擎未就绪"。代码里兼容了嵌套对象形态。
+5. **`n_ctx` 与 `max_context_tokens` 是两个字段**：`config.py:46` 是引擎实跑上下文
+   （容器里被 `DSHINFER_N_CTX=32768` 覆盖），`config.py:27` 是模型训练上限 65536。
+   面板显示前者、后者放 title，免得拿 65,536 去套 32,768 的部署。
+6. **无头截图**：`msedge --headless=new --virtual-time-budget=9000 --screenshot=...` 能出图，
+   但虚拟时间会让 2 s 轮询在几百毫秒内跑完，曲线只有几个点、数字容易是 0；
+   要真实曲线用 CDP（`--remote-debugging-port` + `Page.captureScreenshot`），
+   让页面按真实墙钟跑 20 s 再截。
+
+### 14.8 已知局限
+
+- 曲线只在浏览器内存里，刷新/换标签页就清空；没有历史落盘、也没有告警。
+- mock 引擎（`DSHINFER_ENGINE=mock`）时 `engine_metrics` 是空对象，引擎表和 tok/s 显示"—"。
+- 只在单机单卡验证过；多卡（`nvidia-smi` 索引 0 以外）没有实现。
+- 页面没有鉴权：`/dashboard` 与 `/admin/live` 跟 API 一样只监听 compose 里的
+  `127.0.0.1:8000`，别把它直接暴露到公网。
+
 
 
