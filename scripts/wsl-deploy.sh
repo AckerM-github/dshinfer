@@ -143,6 +143,19 @@ else
 fi
 
 head1 "4/4 结果"
+# /healthz 已就绪，但容器自带的 healthcheck 有 interval/start-period，此刻常是 starting；
+# 等它变 healthy 再打印，省得下次看到「Up 4 seconds (health: starting)」又怀疑一次。
+for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  _health=$(d inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' dshinfer 2>/dev/null || true)
+  [ "$_health" = healthy ] && break
+  [ "$_health" = none ] && break
+  sleep 2
+done
+if [ "${_health:-}" = healthy ]; then
+  ok "容器 healthcheck 已转 healthy"
+else
+  warn "容器 healthcheck 仍是 ${_health:-?}（服务 /healthz 已就绪，可能还在 start-period 内）"
+fi
 echo "  代码版本：$(git rev-parse --short HEAD)"
 echo "  镜像    ：$(d images dshinfer:local --format '{{.ID}}  {{.CreatedSince}}  {{.Size}}' 2>/dev/null | head -1)"
 echo "  容器    ：$(d ps --filter name=dshinfer --format '{{.Status}}' 2>/dev/null | head -1)"
