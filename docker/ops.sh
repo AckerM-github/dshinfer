@@ -17,6 +17,7 @@
 #   bench [args]    停服务 → 一次性容器跑 llama-bench → 自动拉起服务
 #   models          打印权重清单并校验目标目录里的文件
 #   shell           进入容器 bash
+#   tui             容器里打开终端面板（Textual，需要 TTY；q 退出）
 set -eo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -370,8 +371,21 @@ cmd_models() {
 
 cmd_shell() { d exec -it "$CONTAINER" bash; }
 
+# ---------------------------------------------------------------- tui
+
+# 面板必须在容器里跑：引擎的 8014/metrics 只绑容器内的 127.0.0.1，宿主看不到；
+# NVML 也只在容器里挂着（compose.wsl.yaml 把 /usr/lib/wsl 只读挂进去）。
+cmd_tui() {
+  if [ "$(d inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" != "true" ]; then
+    die "容器 $CONTAINER 没在跑：先 bash docker/ops.sh up"
+  fi
+  # -it 两个都要：Textual 要 TTY 才能接管屏幕；不带 -i 连按键都收不到
+  d exec -it -e TERM="${TERM:-xterm-256color}" "$CONTAINER" \
+    python -m dshinfer.tui --monitor "$@"
+}
+
 usage() {
-  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-help}" in
@@ -386,6 +400,7 @@ case "${1:-help}" in
   bench)   shift; cmd_bench "$@" ;;
   models)  cmd_models ;;
   shell)   cmd_shell ;;
+  tui)     shift; cmd_tui "$@" ;;
   help|-h|--help) usage ;;
   *) bad "未知命令：$1"; echo; usage; exit 2 ;;
 esac

@@ -1,0 +1,197 @@
+/* dshinfer TUI 样式：暗色、窄边框、数据优先。
+   颜色语义：青色=主数据、绿色=正常、黄色=注意、红色=危险、灰色=次要。 */
+
+Screen {
+    background: #0b0e12;
+    color: #cfd6de;
+}
+
+#topbar {
+    height: 2;
+    background: #11161c;
+    color: #9fb0c0;
+    padding: 0 1;
+    border-bottom: solid #1d242c;
+}
+
+#hintbar {
+    height: 1;
+    background: #11161c;
+    color: #7d8894;
+    padding: 0 1;
+}
+
+/* ---------------------------------------------------------------- 向导 */
+
+#body {
+    height: 1fr;
+    padding: 1 2;
+}
+
+.wizard-label {
+    color: #e6edf3;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+.wizard-note {
+    color: #7d8894;
+    margin-bottom: 1;
+}
+
+.field-label {
+    color: #9fb0c0;
+    margin-top: 1;
+}
+
+.summary {
+    color: #cfd6de;
+}
+
+OptionList {
+    height: auto;
+    max-height: 18;
+    background: #0d1117;
+    border: round #232b34;
+    padding: 0 1;
+}
+
+OptionList > .option-list--option-highlighted {
+    background: #1f6feb;
+    color: #ffffff;
+}
+
+Input {
+    background: #0d1117;
+    border: round #232b34;
+}
+
+Input:focus {
+    border: round #1f6feb;
+}
+
+/* ---------------------------------------------------------------- 弹层 */
+
+HelpScreen, QuitScreen {
+    align: center middle;
+    background: #000000 60%;
+}
+
+#help-box {
+    width: 84;
+    height: auto;
+    max-height: 90%;
+    background: #11161c;
+    border: round #2d3742;
+    padding: 1 2;
+}
+
+.help-title {
+    color: #e6edf3;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+.help-body {
+    color: #cfd6de;
+    margin-bottom: 1;
+}
+
+.help-hint {
+    color: #7d8894;
+}
+
+#quit-choices {
+    height: auto;
+    max-height: 8;
+}
+
+/* ---------------------------------------------------------------- 监视器 */
+
+#view-overview,
+#view-serving,
+#view-requests,
+#view-engine,
+#view-hardware,
+#view-logs,
+#view-connect {
+    height: 1fr;
+    padding: 0 1;
+}
+
+.row {
+    height: auto;
+}
+
+.kpi {
+    width: 1fr;
+    height: 6;
+    border: round #232b34;
+    background: #0f141a;
+    padding: 0 1;
+}
+
+.spark {
+    width: 1fr;
+    height: 8;
+    border: round #232b34;
+    background: #0f141a;
+    padding: 0 1;
+}
+
+.spark-summary {
+    height: 1;
+}
+
+Sparkline {
+    height: 1fr;
+}
+
+.section-title {
+    margin: 1 0 0 0;
+    color: #8fb8e0;
+}
+
+DataTable {
+    height: auto;
+    max-height: 18;
+    background: #0d1117;
+}
+
+DataTable.mini {
+    max-height: 12;
+}
+
+#logs {
+    height: 1fr;
+    background: #0a0d11;
+    border: round #232b34;
+}
+
+#connect-body,
+#hw-cpu,
+#hw-mem,
+#ctx-line,
+#model-line,
+#mem-line,
+#serve-summary,
+#engine-summary,
+#req-summary,
+#logs-head,
+#hw-summary {
+    height: auto;
+}
+
+/* 卡片标题默认用的是边框色（很暗），提亮一档，否则 KPI 卡标题在终端里几乎看不见。 */
+.kpi, .spark, #logs {
+    border-title-color: #8fb8e0;
+}
+
+/* 曲线用从暗到亮的渐变，低值不刺眼、高值醒目。 */
+.spark Sparkline > .sparkline--min-color {
+    color: #14405f;
+}
+
+.spark Sparkline > .sparkline--max-color {
+    color: #3fa7ff;
+}

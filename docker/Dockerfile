@@ -70,10 +70,14 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 
 # 装进独立 venv：不污染系统 python，构建完可以直接 rm 掉 pip 缓存
+# [tui]：终端面板（Textual）。容器里也要能看盘，所以默认装进镜像；
+# 不想要就在构建时加 --build-arg TUI_EXTRA= 。
+ARG TUI_EXTRA="[tui]"
 RUN python3 -m venv /opt/venv \
  && /opt/venv/bin/pip install --upgrade pip setuptools wheel \
- && /opt/venv/bin/pip install . \
- && /opt/venv/bin/python -c "import dshinfer, fastapi, httpx; print('dshinfer import ok')"
+ && /opt/venv/bin/pip install ".${TUI_EXTRA}" \
+ && /opt/venv/bin/python -c "import dshinfer, fastapi, httpx; print('dshinfer import ok')" \
+ && /opt/venv/bin/python -c "import dshinfer.tui; print('dshinfer.tui import ok')"
 
 # chat template 随镜像走（原文件在 D:\llm\runtime\chat_template.jinja，8908 B），
 # 需要换模型时优先用 compose 的卷覆盖 /app/runtime/chat_template.jinja

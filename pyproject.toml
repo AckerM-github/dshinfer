@@ -17,6 +17,12 @@ dependencies = [
 
 [project.scripts]
 dshinfer = "dshinfer.main:run"
+dshinfer-tui = "dshinfer.tui:main"
+
+[project.optional-dependencies]
+tui = [
+    "textual>=0.89",
+]
 
 [dependency-groups]
 dev = [

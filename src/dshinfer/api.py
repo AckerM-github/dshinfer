@@ -13,17 +13,10 @@ import orjson
 import structlog
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import (
-    HTMLResponse,
-    JSONResponse,
-    Response,
-    StreamingResponse,
-)
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from .config import Settings, get_settings
-from .dashboard import PAGE as DASHBOARD_PAGE
-from .dashboard import live as live_snapshot
 from .engine import EngineError, EngineManager, build_engine
 from .logging import configure_logging
 from .metrics import render
@@ -187,32 +180,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def metrics():
         body, ctype = render()
         return Response(content=body, media_type=ctype)
-
-    @app.get("/dashboard", include_in_schema=False)
-    async def dashboard_page():
-        """内置监控面板（单页，无外部依赖）。数据走 /admin/live。"""
-        return HTMLResponse(DASHBOARD_PAGE)
-
-    @app.get("/admin/live")
-    async def admin_live():
-        """面板用的一次性快照：服务层指标 + 引擎 /metrics + GPU（NVML）。
-
-        引擎抓取和 NVML 都是同步调用，放线程池里跑，别卡住事件循环。
-        """
-        engine_url = (
-            f"http://127.0.0.1:{s.engine_port}/metrics" if s.engine == "llamacpp" else None
-        )
-        return await asyncio.to_thread(
-            live_snapshot,
-            engine_url=engine_url,
-            model=s.model_name,
-            context_tokens=s.n_ctx,
-            max_context_tokens=s.max_context_tokens,
-            engine_kind=s.engine,
-            max_concurrency=s.max_concurrency,
-            queue_limit=s.queue_limit,
-            health=await manager.health(),
-        )
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest, request: Request):
