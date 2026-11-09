@@ -1,23 +1,24 @@
-/* dshinfer TUI 样式：暗色、窄边框、数据优先。
-   颜色语义：青色=主数据、绿色=正常、黄色=注意、红色=危险、灰色=次要。 */
+/* dshinfer TUI 样式：数据优先、窄边框、颜色全部走主题变量。
+   主题由 theme.py 注册（strata 黑绿 / ocean 暗蓝 / paper 浅色），监视器里按 t 切换。
+   颜色语义：主数据 = $primary、正常 = $success、注意 = $warning、危险 = $error、次要 = $text-muted。 */
 
 Screen {
-    background: #0b0e12;
-    color: #cfd6de;
+    background: $background;
+    color: $foreground;
 }
 
 #topbar {
     height: 2;
-    background: #11161c;
-    color: #9fb0c0;
+    background: $panel;
+    color: $foreground;
     padding: 0 1;
-    border-bottom: solid #1d242c;
+    border-bottom: solid $card-border;
 }
 
 #hintbar {
     height: 1;
-    background: #11161c;
-    color: #7d8894;
+    background: $panel;
+    color: $text-muted;
     padding: 0 1;
 }
 
@@ -29,76 +30,76 @@ Screen {
 }
 
 .wizard-label {
-    color: #e6edf3;
+    color: $foreground;
     text-style: bold;
     margin-bottom: 1;
 }
 
 .wizard-note {
-    color: #7d8894;
+    color: $text-muted;
     margin-bottom: 1;
 }
 
 .field-label {
-    color: #9fb0c0;
+    color: $text-muted;
     margin-top: 1;
 }
 
 .summary {
-    color: #cfd6de;
+    color: $foreground;
 }
 
 OptionList {
     height: auto;
     max-height: 18;
-    background: #0d1117;
-    border: round #232b34;
+    background: $surface;
+    border: round $card-border;
     padding: 0 1;
 }
 
 OptionList > .option-list--option-highlighted {
-    background: #1f6feb;
-    color: #ffffff;
+    background: $primary;
+    color: $background;
 }
 
 Input {
-    background: #0d1117;
-    border: round #232b34;
+    background: $surface;
+    border: round $card-border;
 }
 
 Input:focus {
-    border: round #1f6feb;
+    border: round $primary;
 }
 
 /* ---------------------------------------------------------------- 弹层 */
 
 HelpScreen, QuitScreen {
     align: center middle;
-    background: #000000 60%;
+    background: $background 60%;
 }
 
 #help-box {
     width: 84;
     height: auto;
     max-height: 90%;
-    background: #11161c;
-    border: round #2d3742;
+    background: $panel;
+    border: round $card-border;
     padding: 1 2;
 }
 
 .help-title {
-    color: #e6edf3;
+    color: $foreground;
     text-style: bold;
     margin-bottom: 1;
 }
 
 .help-body {
-    color: #cfd6de;
+    color: $foreground;
     margin-bottom: 1;
 }
 
 .help-hint {
-    color: #7d8894;
+    color: $text-muted;
 }
 
 #quit-choices {
@@ -123,49 +124,52 @@ HelpScreen, QuitScreen {
     height: auto;
 }
 
+/* 卡片用双层边框（和 Strata 一样的观感），标题取主题主色。 */
 .kpi {
     width: 1fr;
     height: 6;
-    border: round #232b34;
-    background: #0f141a;
+    border: double $card-border;
+    background: $card-bg;
     padding: 0 1;
 }
 
 .spark {
     width: 1fr;
-    height: 8;
-    border: round #232b34;
-    background: #0f141a;
+    height: 5;
+    border: double $card-border;
+    background: $card-bg;
     padding: 0 1;
 }
 
-.spark-summary {
-    height: 1;
-}
-
-Sparkline {
-    height: 1fr;
+#phase-line {
+    height: auto;
 }
 
 .section-title {
     margin: 1 0 0 0;
-    color: #8fb8e0;
+    color: $primary;
 }
 
 DataTable {
     height: auto;
     max-height: 18;
-    background: #0d1117;
+    background: $surface;
 }
 
 DataTable.mini {
     max-height: 12;
 }
 
+DataTable > .datatable--header {
+    background: $panel;
+    color: $primary;
+    text-style: bold;
+}
+
 #logs {
     height: 1fr;
-    background: #0a0d11;
-    border: round #232b34;
+    background: $card-bg;
+    border: double $card-border;
 }
 
 #connect-body,
@@ -184,14 +188,49 @@ DataTable.mini {
 
 /* 卡片标题默认用的是边框色（很暗），提亮一档，否则 KPI 卡标题在终端里几乎看不见。 */
 .kpi, .spark, #logs {
-    border-title-color: #8fb8e0;
+    border-title-color: $primary;
 }
 
-/* 曲线用从暗到亮的渐变，低值不刺眼、高值醒目。 */
-.spark Sparkline > .sparkline--min-color {
-    color: #14405f;
+/* ---------------------------------------------------------------- 窄屏（≤ 99 列）
+
+   80 列是 SSH / 分屏 / 竖屏的常见宽度，150 列那套四卡横排在这里每张只剩 19 格，
+   数字和副标题全糊。窄屏策略和 Strata 一致：KPI 改两列、趋势图降成单行、只留一张、
+   表格砍列。类由 MonitorApp.on_resize 挂在 Screen 上。 */
+
+.compact .kpi {
+    height: 5;
 }
 
-.spark Sparkline > .sparkline--max-color {
-    color: #3fa7ff;
+.compact #row-kpi {
+    layout: grid;
+    grid-size: 2;
+    grid-gutter: 0 1;
+}
+
+.compact #row-spark {
+    layout: horizontal;
+    height: auto;
+}
+
+.compact .spark {
+    height: 4;
+}
+
+.compact #s-vram,
+.compact #mem-line {
+    display: none;
+}
+
+/* 26 行的窄终端里内容一定放不下：滚动条本身占 1–2 列，比让它出现更亏。 */
+.compact VerticalScroll,
+.compact DataTable {
+    scrollbar-size-vertical: 0;
+}
+
+.compact #recent {
+    max-height: 5;
+}
+
+.compact .section-title {
+    margin: 0;
 }

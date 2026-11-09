@@ -1,14 +1,16 @@
 """TUI 的显示零件与格式化工具。
 
 设计约束：
-  · 只用 Textual 自带的 Static / Sparkline / DataTable 等，不引第三方渲染库；
+  · 只用 Textual 自带的 Static / DataTable 等，曲线用块字符自己画，不引第三方渲染库；
   · 颜色语义集中在 tone_for()，别在视图里散落 ["red"] 之类的魔法字面量；
   · 所有格式化函数必须容忍 None（面板最常见的情况就是"这一项读不到"）。
 """
 
 from __future__ import annotations
 
-from textual.widgets import DataTable, Sparkline, Static
+from textual.widgets import DataTable, Static
+
+from .theme import readable
 
 # ---------------------------------------------------------------- 格式化
 
@@ -79,14 +81,28 @@ def short_id(text: str, keep: int = 10) -> str:
 
 # ---------------------------------------------------------------- 色阶
 
+#: 当前主题名（MonitorApp 切主题时更新）：浅色主题要把黄/绿换成深色版才看得清。
+_ACTIVE_THEME = "strata"
+
+
+def set_active_theme(name: str) -> None:
+    global _ACTIVE_THEME
+    _ACTIVE_THEME = name or "strata"
+
+
+def theme_tone(tone: str) -> str:
+    """按当前主题修正一个语义色名。"""
+    return readable(_ACTIVE_THEME, tone)
+
+
 def tone_for(pct: float | None, warn: float = 75.0, danger: float = 90.0) -> str:
     if pct is None:
         return "dim"
     if pct >= danger:
-        return "red"
+        return theme_tone("red")
     if pct >= warn:
-        return "yellow"
-    return "green"
+        return theme_tone("yellow")
+    return theme_tone("green")
 
 
 def tone_of_latency(ms: float | None) -> str:
@@ -96,8 +112,8 @@ def tone_of_latency(ms: float | None) -> str:
     if ms >= 2000:
         return "red"
     if ms >= 500:
-        return "yellow"
-    return "green"
+        return theme_tone("yellow")
+    return theme_tone("green")
 
 
 # ---------------------------------------------------------------- 条形
@@ -122,14 +138,27 @@ def bar(pct: float | None, width: int = 16, tone: str | None = None) -> str:
     return f"[{colour}]{body}[/]"
 
 
-def meter(label: str, value: float | None, total: float | None, width: int = 14) -> str:
-    """一行「标签 + 条 + 百分比 + 读数」。value/total 任一缺失就整体降级成一行文本。"""
+def meter(
+    label: str,
+    value: float | None,
+    total: float | None,
+    width: int = 14,
+    unit: str = "mib",
+) -> str:
+    """一行「标签 + 条 + 百分比 + 读数」。value/total 任一缺失就整体降级成一行文本。
+
+    unit 决定读数怎么格式化：mib（内存/显存）或 tokens（上下文占用）。
+    """
     if value is None or not total:
         return f"[dim]{label}[/]  {DASH}"
     pct = value / total * 100.0
+    if unit == "tokens":
+        reading = f"{fmt_int(value)} / {fmt_int(total)}"
+    else:
+        reading = f"{fmt_mib(value)} / {fmt_mib(total)}"
     return (
         f"[dim]{label}[/]  {bar(pct, width)}  "
-        f"[{tone_for(pct)}]{pct:5.1f}%[/]  [dim]{fmt_mib(value)} / {fmt_mib(total)}[/]"
+        f"[{tone_for(pct)}]{pct:5.1f}%[/]  [dim]{reading}[/]"
     )
 
 
@@ -152,26 +181,46 @@ class Kpi(Static):
     ) -> None:
         unit_part = f" [dim]{unit}[/]" if unit else ""
         sub_part = f"\n[dim]{sub}[/]" if sub else ""
-        self.update(f"[bold {tone}]{main}[/]{unit_part}{sub_part}")
+        self.update(f"[bold {theme_tone(tone)}]{main}[/]{unit_part}{sub_part}")
+
+
+_SPARK_BLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+def spark_line(values: list[float], width: int, top: float | None = None) -> str:
+    """一行块状 sparkline：以窗口最大值为满格，新数据靠右（对标 Strata 的曲线）。"""
+    data = [float(v) for v in values][-max(1, width):]
+    if not data:
+        return "[dim]" + "·" * max(1, width) + "[/]"
+    ceiling = top if top and top > 0 else max(data)
+    if ceiling <= 0:
+        ceiling = 1.0
+    chars = []
+    for value in data:
+        ratio = max(0.0, min(1.0, value / ceiling))
+        index = int(round(ratio * (len(_SPARK_BLOCKS) - 1)))
+        chars.append(_SPARK_BLOCKS[index])
+    return "".join(chars).rjust(max(1, width))
 
 
 class Spark(Static):
-    """带标题的曲线卡：数据点由外部喂，浏览器内存只留最近 N 点。"""
+    """带标题的曲线卡：一行块状 sparkline + 一行摘要，宽度自适应。"""
 
-    def __init__(self, title: str, summary: str = "", **kwargs) -> None:
+    def __init__(self, title: str, **kwargs) -> None:
         super().__init__(**kwargs)
         self.border_title = title
-        self._summary = summary
 
-    def compose(self):
-        yield Sparkline([], id="spark")
-        yield Static("", id="spark-summary", classes="spark-summary")
-
-    def set_data(self, values: list[float], summary: str = "") -> None:
-        spark = self.query_one("#spark", Sparkline)
-        spark.data = list(values[-120:])
-        text = summary or self._summary
-        self.query_one("#spark-summary", Static).update(f"[dim]{text}[/]" if text else "")
+    def set_data(
+        self,
+        values: list[float],
+        summary: str = "",
+        tone: str = "cyan",
+        top: float | None = None,
+    ) -> None:
+        width = max(8, (self.size.width or 40) - 2)
+        body = spark_line(list(values)[-width:], width, top)
+        text = f"[dim]{summary}[/]\n" if summary else ""
+        self.update(f"{text}[{tone}]{body}[/]")
 
 
 def ensure_columns(table: DataTable, columns: list[str]) -> None:
