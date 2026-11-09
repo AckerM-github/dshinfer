@@ -25,7 +25,6 @@ cd "$ROOT"
 CONTAINER=dshinfer
 IMAGE=dshinfer:local
 HTTP=http://127.0.0.1:8000
-MODELS_DIR="${MODELS_DIR:-$HOME/models}"
 BENCH_MODEL="${BENCH_MODEL:-/models/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q4_K_M.gguf}"
 
 is_wsl() { grep -qi microsoft /proc/version 2>/dev/null; }
@@ -47,6 +46,16 @@ fi
 
 dc() { $SUDO docker compose $COMPOSE_FILES "$@"; }
 d()  { $SUDO docker "$@"; }
+
+# 权重目录：优先取容器 /models 的实际挂载源 —— 那才是容器真正读的目录。
+# 直接写 $HOME/models 在 sudo 下会变成 /root/models（sudo 重置 HOME），校验就全 MISSING。
+container_models_dir() {
+  d inspect -f '{{range .Mounts}}{{if eq .Destination "/models"}}{{.Source}}{{end}}{{end}}' "$CONTAINER" 2>/dev/null | head -n 1
+}
+if [ -z "${MODELS_DIR:-}" ]; then
+  MODELS_DIR=$(container_models_dir)
+  [ -n "$MODELS_DIR" ] || MODELS_DIR="$HOME/models"
+fi
 
 hr()    { echo '--------------------------------------------------------------'; }
 head1() { hr; echo "== $*"; }
@@ -199,11 +208,26 @@ if e.get("last_error"):
 
   step "5/7 权重校验（models/models.json）"
   if [ -f scripts/fetch-model.sh ]; then
-    if bash scripts/fetch-model.sh --check --target "$MODELS_DIR" > /tmp/ops-check-models.log 2>&1; then
-      grep -c '^OK' /tmp/ops-check-models.log | sed 's/^/  /' | { read -r c; ok "$c 个文件大小与 sha256 全部通过"; }
-      grep '^OK' /tmp/ops-check-models.log | sed 's/^/    /'
+    # 日志用 mktemp：固定路径 /tmp/xxx 在 sudo 下会踩 fs.protected_regular ——
+    # 同一个文件先前被普通用户建过（0644、属主 linc）时，root 带 O_CREAT 打开它会被
+    # 内核直接拒绝（Permission denied），于是校验脚本其实跑通了、这里却报 FAIL。
+    local clog=""
+    clog=$(mktemp "${TMPDIR:-/tmp}/ops-check-models.XXXXXX" 2>/dev/null) || clog=""
+    if [ -n "$clog" ]; then
+      if bash scripts/fetch-model.sh --check --target "$MODELS_DIR" > "$clog" 2>&1; then
+        grep -c '^OK' "$clog" | sed 's/^/  /' | { read -r c; ok "$c 个文件大小与 sha256 全部通过"; }
+        grep '^OK' "$clog" | sed 's/^/    /'
+      else
+        bad "校验失败，详见 $clog"; tail -5 "$clog" | sed 's/^/    /'; rc=1
+      fi
+      rm -f "$clog"
     else
-      bad "校验失败，详见 /tmp/ops-check-models.log"; tail -5 /tmp/ops-check-models.log | sed 's/^/    /'; rc=1
+      # 连 mktemp 都不行就直接跑，不打日志
+      if bash scripts/fetch-model.sh --check --target "$MODELS_DIR"; then
+        ok "权重校验通过（未落日志）"
+      else
+        bad "权重校验失败"; rc=1
+      fi
     fi
   else
     warn "scripts/fetch-model.sh 不存在，跳过"

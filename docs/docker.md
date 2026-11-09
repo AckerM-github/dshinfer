@@ -401,8 +401,8 @@ bash docker/ops.sh <命令> [参数]
 
 自动适配：WSL2 下叠加 `docker/compose.wsl.yaml`，非 WSL 主机只用 `docker/compose.yaml`；
 需要时自动给 docker 加 `sudo`（用 `sudo -n docker info` 探测）。三个可覆盖的环境变量：
-`OPS_COMPOSE_FILES`（自定义 compose 文件串）、`MODELS_DIR`（默认 `$HOME/models`）、
-`BENCH_MODEL`（默认 Q4_K_M 的容器内路径）。
+`OPS_COMPOSE_FILES`（自定义 compose 文件串）、`MODELS_DIR`（默认取容器 `/models` 的
+实际挂载源，取不到才退回 `~/models`）、`BENCH_MODEL`（默认 Q4_K_M 的容器内路径）。
 
 | 命令 | 作用 |
 | --- | --- |
@@ -430,13 +430,24 @@ check                   → 7 项全 OK，权重 3/3 sha256 通过，显存 5999
 bogus                   → 打印用法，exit 2
 ```
 
-写这个脚本时踩到两个 bash 坑，记下来省得再犯：
+写这个脚本时踩到四个坑，记下来省得再犯：
 
 1. **EXIT trap 里读不到函数的 local 变量** —— trap 在脚本退出时触发，此时函数已返回，
    bash 的动态作用域随之消失，`[ "$was_up" = 1 ]` 永远为假，服务被停掉就再没起来。
    改成顶层全局变量 `BENCH_WAS_UP/BENCH_STAY_DOWN/BENCH_RESTARTED` 后正常。
 2. **`case` 模式里的空格** —— 用 `running\ healthy)` 这种反斜杠转义在多层引号传递中容易被吃掉，
    直接给整个模式加引号 `"running healthy")` 更稳。
+3. **`/tmp` 固定文件名 + sudo = 假报错** —— `check` 原来把 `fetch-model.sh` 的输出重定向到
+   `/tmp/ops-check-models.log`。这个文件先前被普通用户（linc）建过（0644），之后用
+   `sudo bash docker/ops.sh check` 再写同一个路径时，内核的 `fs.protected_regular`
+   （默认 2）会拒绝 root 带 `O_CREAT` 打开 sticky 目录里属于别人的已有文件，
+   报 `Permission denied` —— 权重其实校验通过了，脚本却打 `[FAIL]`。
+   改用 `mktemp` 拿唯一临时文件，跑完删除。
+4. **`sudo` 下 `$HOME` 变成 `/root`** —— `MODELS_DIR` 原来默认 `$HOME/models`，
+   于是 `sudo bash docker/ops.sh check` 去校验 `/root/models`，三个权重全 `MISSING`。
+   现在先问 docker 要容器 `/models` 的实际挂载源
+   （`d inspect -f '{{range .Mounts}}{{if eq .Destination "/models"}}{{.Source}}{{end}}{{end}}'`），
+   拿不到才退回 `$HOME/models`；这样普通用户和 root 跑都指向同一目录。
 
 ## 13. 源码怎么进 WSL：git 单源 + scripts/wsl-deploy.sh
 
