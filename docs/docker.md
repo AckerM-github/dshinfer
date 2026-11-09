@@ -49,6 +49,7 @@ docs/docker.md               本文
 models/models.json           权重清单：字节数 + sha256 + 来源（权重本体不进镜像也不进 git）
 models/SHA256SUMS            校验和，`sha256sum -c` 直接可用
 scripts/fetch-model.sh       权重校验/下载工具：--check / --download / --sums / --list
+scripts/wsl-deploy.sh        git 单源部署：clone/pull → ops.sh up --build → 等 /healthz
 ```
 
 镜像里做的 4 件关键事：
@@ -436,5 +437,71 @@ bogus                   → 打印用法，exit 2
    改成顶层全局变量 `BENCH_WAS_UP/BENCH_STAY_DOWN/BENCH_RESTARTED` 后正常。
 2. **`case` 模式里的空格** —— 用 `running\ healthy)` 这种反斜杠转义在多层引号传递中容易被吃掉，
    直接给整个模式加引号 `"running healthy")` 更稳。
+
+## 13. 源码怎么进 WSL：git 单源 + scripts/wsl-deploy.sh
+
+之前是手工 `cp -r /mnt/d/llm/infer ~/infer`（或 rsync）：改一次 D 盘的代码就要记得再拷一次，
+两边逐渐漂移，容器里跑的到底是哪一版说不清。
+
+现在：**代码只有一份事实来源 = git 仓库**，WSL 里的 `~/infer` 是 clone 出来的运行副本。
+
+- 改代码：在 Windows 的 `D:\llm\infer` 里改 → commit（本地 remote 是同一份仓库，push 到 GitHub 只是备份）
+- 部署：WSL 里 `bash scripts/wsl-deploy.sh` → `git pull --ff-only` → `docker/ops.sh up --build` → 等 `/healthz`
+
+### 13.1 首次迁移：把 cp 副本换成 clone
+
+```bash
+# 先只同步代码，不动容器（会打印新目录的 HEAD）
+bash /mnt/d/llm/infer/scripts/wsl-deploy.sh --fresh --no-up
+# 确认没问题，再重建并重启
+bash /mnt/d/llm/infer/scripts/wsl-deploy.sh --fresh
+```
+
+`--fresh` 会把现有 `~/infer` 改名成 `~/infer.bak.<时间戳>` 再 clone；旧目录里的 `.env`
+会顺手带进新目录（容器不读它，只有 Windows 原生 `uv run` 用）。确认迁移成功后备份可删：
+`rm -rf ~/infer.bak.*`。
+
+### 13.2 日常
+
+```bash
+cd ~/infer
+bash scripts/wsl-deploy.sh                 # 拉最新 + 重建 + 起容器 + 等 /healthz
+bash scripts/wsl-deploy.sh --no-build      # 只重启（Python 代码没变）
+bash scripts/wsl-deploy.sh --no-up         # 只同步代码，不动容器
+bash scripts/wsl-deploy.sh --source git@github.com:AckerM-github/dshinfer.git --fresh
+```
+
+| 选项 | 作用 |
+| --- | --- |
+| `--fresh` | 备份现有目录后重新 clone（首次迁移 / 换来源用） |
+| `--no-build` | 跳过镜像构建，只重启容器 |
+| `--no-up` | 只同步代码 |
+| `--source PATH` | 首次 clone 的来源，默认 `/mnt/d/llm/infer`（也可以是 GitHub 地址） |
+| `--branch NAME` | 分支，默认 `main` |
+| `--dir PATH` | 目标目录，默认 `$HOME/infer` |
+
+### 13.3 要点与坑
+
+1. **来源默认是本地路径** `/mnt/d/llm/infer`：零网络、秒级 clone，适合当前这台机器。
+   想改成直接从 GitHub 拉，`--source git@github.com:AckerM-github/dshinfer.git --fresh`；
+   但 WSL 里 GitHub 的 22 端口现在被挡（`Connection closed by 198.18.0.25 port 22`），HTTPS 每次要凭证，
+   所以先走本地路径，Windows 侧再 push 到 GitHub 备份。
+2. **`git pull --ff-only`**：本地有改动就直接失败，不会静默 merge。脚本同步后会列出未提交改动
+   —— 这些文件会被打进镜像，等于「部署了一个不在 git 里的版本」，看到警告先处理。
+3. **WSL 里 docker 要 sudo**：脚本自己探测（`sudo -n docker info`）并给 docker 调用加前缀。
+   实测踩到的坑：汇总行忘了加 sudo，docker CLI 报 permission denied 时**还会往 stdout 吐一个空行**，
+   于是输出变成「镜像 ：」换行「未知」；排查这类空行先想权限。
+4. 每次 deploy 都是 `ops.sh up --build`；镜像重建后 compose 会 recreate 容器（重载权重 5–15 s）。
+   只想重启进程用 `bash docker/ops.sh restart`，别用 deploy。
+
+### 13.4 实测（2026-11-09，Ubuntu 26.04 / docker 29.1.3）
+
+```
+--fresh --no-up    → 备份 ~/infer.bak.20261109-234702，clone 932 KB 用时 <1 s，HEAD a781ae8
+再跑一次            → Already up to date / 已是最新（幂等）
+首次 build         → pip 层重建 59 s（.dockerignore 变过、缓存失效），之后基本全 CACHED
+up + 等 /healthz   → 冷启动 14 s，重建后 6 s
+```
+
 
 

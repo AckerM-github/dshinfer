@@ -1,6 +1,8 @@
 # WSL2 覆盖层：本机（Ubuntu 26.04 / WSL 3.0.3 / 无 nvidia-container-toolkit）用法
 #
-#   cp -r /mnt/d/llm/infer ~/infer && cd ~/infer
+#   git clone /mnt/d/llm/infer ~/infer && cd ~/infer       # 或用 scripts/wsl-deploy.sh --fresh
+#   bash scripts/wsl-deploy.sh                              # = pull + build + up + 等 /healthz
+# 手工等价：
 #   docker compose -f docker/compose.yaml -f docker/compose.wsl.yaml build
 #   docker compose -f docker/compose.yaml -f docker/compose.wsl.yaml up -d
 #

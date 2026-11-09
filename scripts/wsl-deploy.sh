@@ -31,6 +31,13 @@ ok()    { echo "  [OK]   $*"; }
 warn()  { echo "  [WARN] $*"; }
 die()   { echo "  [FAIL] $*"; exit 1; }
 
+# WSL 里 docker 通常要 sudo（docs/docker.md 10.2 装的是 apt 的 docker.io）
+SUDO=""
+if ! docker info >/dev/null 2>&1; then
+  sudo -n docker info >/dev/null 2>&1 && SUDO=sudo
+fi
+d() { $SUDO docker "$@"; }
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --fresh)    FRESH=1 ;;
@@ -121,6 +128,6 @@ fi
 
 head1 "4/4 结果"
 echo "  代码版本：$(git rev-parse --short HEAD)"
-echo "  镜像    ：$(docker image inspect dshinfer:local --format '{{.Id}} {{.CreatedSince}}' 2>/dev/null || echo 未知)"
-echo "  容器    ：$(docker ps --filter name=dshinfer --format '{{.Status}}' 2>/dev/null | head -1)"
+echo "  镜像    ：$(d image inspect dshinfer:local --format '{{.Id}} {{.CreatedSince}}' 2>/dev/null | head -1)"
+echo "  容器    ：$(d ps --filter name=dshinfer --format '{{.Status}}' 2>/dev/null | head -1)"
 echo "  下一步  ：bash docker/ops.sh check   # 7 项体检"
