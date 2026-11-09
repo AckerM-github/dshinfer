@@ -144,6 +144,6 @@ fi
 
 head1 "4/4 结果"
 echo "  代码版本：$(git rev-parse --short HEAD)"
-echo "  镜像    ：$(d image inspect dshinfer:local --format '{{.Id}} {{.CreatedSince}}' 2>/dev/null | head -1)"
+echo "  镜像    ：$(d images dshinfer:local --format '{{.ID}}  {{.CreatedSince}}  {{.Size}}' 2>/dev/null | head -1)"
 echo "  容器    ：$(d ps --filter name=dshinfer --format '{{.Status}}' 2>/dev/null | head -1)"
 echo "  下一步  ：bash docker/ops.sh check   # 7 项体检"
