@@ -42,6 +42,8 @@
 docker/Dockerfile            单容器镜像：ubuntu:24.04 + python3.12 + b12202 的 Linux CUDA 12.8 引擎
 docker/compose.yaml          GPU 预留 + 权重只读卷 + env 与 .env 逐条对齐 + healthcheck
 docker/chat_template.jinja   从 D:\llm\runtime\chat_template.jinja 复制的 8908 B 模板
+docker/compose.wsl.yaml      WSL2 覆盖层：/dev/dxg 直通、ext4 权重路径、32K 上下文默认值
+docker/ops.sh                运维入口：up / down / status / check / logs / bench / models / shell
 .dockerignore                构建上下文排除（上下文是仓库根）
 docs/docker.md               本文
 models/models.json           权重清单：字节数 + sha256 + 来源（权重本体不进镜像也不进 git）
@@ -387,5 +389,52 @@ TTFT 0.88 s / 首字到 40 token 用时 2.35 s（64K 配置）
 中文解释：语义正确；代码题：缩进正确、可直接运行
 /v1/models 同时列出 Q4_K_M（loaded）与 Q3_K_M（not loaded）
 ```
+
+## 12. 日常运维：一条命令（docker/ops.sh）
+
+前面 11 节里的命令够用但太碎。`docker/ops.sh` 把它们收成一个入口：
+
+```bash
+bash docker/ops.sh <命令> [参数]
+```
+
+自动适配：WSL2 下叠加 `docker/compose.wsl.yaml`，非 WSL 主机只用 `docker/compose.yaml`；
+需要时自动给 docker 加 `sudo`（用 `sudo -n docker info` 探测）。三个可覆盖的环境变量：
+`OPS_COMPOSE_FILES`（自定义 compose 文件串）、`MODELS_DIR`（默认 `$HOME/models`）、
+`BENCH_MODEL`（默认 Q4_K_M 的容器内路径）。
+
+| 命令 | 作用 |
+| --- | --- |
+| `up [--build]` | 构建（可选）+ 后台启动 + 轮询 `/healthz`（最多 300 s），就绪后打印容器状态 |
+| `down` / `stop` / `start` / `restart` | 对应 compose 操作；`start` 不重建容器 |
+| `status` | 容器 + `/healthz`（json 美化）+ 显存 + docker 磁盘占用 + 权重分区剩余 |
+| `check` | 7 项体检：docker / 容器 healthy / 引擎 ready / `/v1/models` / 权重 sha256 / 显存 / 磁盘；有问题 exit 1 |
+| `logs [N] [-e] [-f]` | 默认服务日志；`-e` 读容器内 `/var/log/dshinfer/llama-server.log`；`-f` 跟随 |
+| `bench [args] [--stay-down]` | 停服务释放显存 → 一次性容器跑 `llama-bench` → 自动拉起服务（`--stay-down` 则停着） |
+| `models` | 打印 `models/models.json` 清单 + 校验 `$MODELS_DIR` 里的文件 |
+| `shell` | `docker exec -it dshinfer bash` |
+
+`bench` 默认参数 `-p 512 -n 128 -ngl 99 -fa 1`，想跑别的直接跟参数，例如
+`bash docker/ops.sh bench -p 2048 -n 128 -ngl 99 -fa 1 -ctk q8_0 -ctv q8_0`。
+它跑一次性容器而不是 `docker exec`，因为服务进程占着 6 GB 显存，不先停会 OOM；
+WSL 下必须带 `-v /usr/lib/wsl:/usr/lib/wsl:ro --device /dev/dxg`（脚本已内置）。
+
+实测（2026-11-09，WSL2 Ubuntu 26.04 + docker 29.1.3，32K 上下文配置）：
+
+```
+up                      → 容器 recreate，18 s 等到 /healthz ready
+bench -p 128 -n 32      → pp128 2054 t/s、tg32 42.06 t/s；跑完自动拉起，4 s 就绪
+bench --stay-down ...   → 容器停在 Exited (143)，再 start 5 s 内 healthz 可用
+check                   → 7 项全 OK，权重 3/3 sha256 通过，显存 5999/8188 MiB
+bogus                   → 打印用法，exit 2
+```
+
+写这个脚本时踩到两个 bash 坑，记下来省得再犯：
+
+1. **EXIT trap 里读不到函数的 local 变量** —— trap 在脚本退出时触发，此时函数已返回，
+   bash 的动态作用域随之消失，`[ "$was_up" = 1 ]` 永远为假，服务被停掉就再没起来。
+   改成顶层全局变量 `BENCH_WAS_UP/BENCH_STAY_DOWN/BENCH_RESTARTED` 后正常。
+2. **`case` 模式里的空格** —— 用 `running\ healthy)` 这种反斜杠转义在多层引号传递中容易被吃掉，
+   直接给整个模式加引号 `"running healthy")` 更稳。
 
 
