@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "doc": "权重清单：权重本体不进 git、不进镜像。这里只记录 id、相对路径、字节数、sha256、角色与来源；校验/下载见 scripts/fetch-model.sh 与 docs/models.md。",
+  "default_id": "dsv4-9b-q4km",
+  "models": [
+    {
+      "id": "dsv4-9b-q4km",
+      "file": "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q4_K_M.gguf",
+      "bytes": 5629111264,
+      "sha256": "a692de9520e4c0bb1512deb91e950f38e14854650aff43419112f87e6052c44b",
+      "role": "production",
+      "note": "默认生产档：8 GB 显存 + 32K 上下文实测 40.4 t/s / 6001 MiB（docs/docker.md 11.2）",
+      "url": "",
+      "provenance": {
+        "kind": "derived",
+        "base_repo": "xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic",
+        "base_rev": "e4bfa83c72896cbb4990c909967d6f27bb97bac4",
+        "base_format": "safetensors（4 shard + model-mtp，18.8 GB；该仓库不发布 GGUF）",
+        "quantizer": "llama-quantize (llama.cpp b12202)",
+        "outtype": "Q4_K_M",
+        "quantize_cmd": "llama-quantize <model-f16.gguf> <out.gguf> Q4_K_M"
+      }
+    },
+    {
+      "id": "dsv4-9b-q3km",
+      "file": "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q3_K_M.gguf",
+      "bytes": 4623526880,
+      "sha256": "a781c335a4208aec93f84dd229b6aecb7d5e41c99e23ad882eae49f9a061dc92",
+      "role": "alternative",
+      "note": "备选档：权重小 ~1 GB，可换来更长上下文或更多显存余量",
+      "url": "",
+      "provenance": {
+        "kind": "derived",
+        "base_repo": "xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic",
+        "base_rev": "e4bfa83c72896cbb4990c909967d6f27bb97bac4",
+        "base_format": "safetensors（4 shard + model-mtp，18.8 GB；该仓库不发布 GGUF）",
+        "quantizer": "llama-quantize (llama.cpp b12202)",
+        "outtype": "Q3_K_M",
+        "quantize_cmd": "llama-quantize <model-f16.gguf> <out.gguf> Q3_K_M"
+      }
+    },
+    {
+      "id": "qwen3.5-0.8b-q8-draft",
+      "file": "draft/Qwen3.5-0.8B-Q8_0.gguf",
+      "bytes": 811843840,
+      "sha256": "0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c",
+      "role": "experiment",
+      "note": "投机解码草稿模型。放 draft/ 子目录是因为 registry.py:84 只 glob 顶层 *.gguf，故不会进 /v1/models；服务层没有 --model-draft 支持，仅 scripts/bench_spec.py 直连引擎时使用",
+      "url": "",
+      "provenance": {
+        "kind": "derived",
+        "base_repo": "Qwen/Qwen3.5-0.8B",
+        "base_rev": "",
+        "base_format": "safetensors（上游只发原始权重）",
+        "quantizer": "llama-quantize (llama.cpp b12202)",
+        "outtype": "Q8_0",
+        "quantize_cmd": "llama-quantize <model-f16.gguf> <out.gguf> Q8_0"
+      }
+    }
+  ]
+}

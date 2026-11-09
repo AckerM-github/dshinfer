@@ -10,6 +10,11 @@ __pycache__/
 # Local config & secrets
 .env
 
+# 模型权重：实体不入库（GitHub 单文件 100 MB 硬限制），只提交 models/models.json + SHA256SUMS
+*.gguf
+*.gguf.part
+*.gguf.part.bad
+
 # Generated artifacts
 eval/results/
 eval/latest.json
