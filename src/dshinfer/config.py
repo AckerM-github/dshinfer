@@ -64,6 +64,13 @@ class Settings(BaseSettings):
     n_ubatch: int = 1024
     # FlashAttention。本机 40 系（sm_89）支持；关掉会明显变慢且更费显存。
     flash_attn: bool = True
+    # llama.cpp 的 --fit 自动降配（我们这份 llama.cpp 构建里默认开启）：显存不够时
+    # 它会自己少 offload 几层到 GPU，并且**不报错、不改 /props 里的 n_ctx**。
+    # 实测 8 GB + n_ctx=65536 时它会选 30/34 层上卡，tg 从 42.1 掉到 26.8 tok/s
+    # （−36%），而短上下文也一样慢——这就是过去「64K 掉速 35%」的真正原因（不是
+    # 深度、不是带宽）。n_ctx 是我们显式钉死的，所以默认关掉：让「装不下」显式失败，
+    # 而不是悄悄变慢。显存更小的卡若加载 OOM，把它设回 true。
+    fit: bool = False
     n_threads: int = 0  # 0 = 让 llama.cpp 自己决定
 
     # ---- llama-server 子进程 ----

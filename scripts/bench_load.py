@@ -9,12 +9,22 @@
 这一项单独分离出来，而这正是我们这几周在写的东西。
 
 跑法：uv run python scripts/bench_load.py
+
+两端点默认指本机原生进程的 8000 / 8124，可改：
+  --service / --engine（或 DSHINFER_BENCH_SERVICE / DSHINFER_BENCH_ENGINE）
+  --levels 1,2,4,8   --per-level 12   --max-tokens 64   --targets service,engine
+
+容器里跑（推荐）：引擎只监听容器内的 127.0.0.1:8124，宿主机直连不到，
+所以用 docker exec 把本文件喂进容器的 venv python：
+  docker exec -i dshinfer /opt/venv/bin/python - < scripts/bench_load.py
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
+import os
 import statistics
 import time
 
@@ -24,14 +34,24 @@ from dshinfer.config import get_settings
 from dshinfer.service import render_prompt
 from dshinfer.schemas import ChatMessage
 
-SERVICE = "http://127.0.0.1:8000"
-ENGINE = "http://127.0.0.1:8124"
+SERVICE = os.environ.get("DSHINFER_BENCH_SERVICE", "http://127.0.0.1:8000")
+ENGINE = os.environ.get("DSHINFER_BENCH_ENGINE", "http://127.0.0.1:8124")
 
 PROMPT = "用三句话解释什么是 KV cache，以及它为什么能加速生成。"
 MAX_TOKENS = 64
 LEVELS = (1, 2, 4, 8)
 PER_LEVEL = 12
 
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="四档并发 x 两个端点的压测")
+    ap.add_argument("--service", default=SERVICE, help="服务层地址（默认 %(default)s）")
+    ap.add_argument("--engine", default=ENGINE, help="llama-server 直连地址（默认 %(default)s）")
+    ap.add_argument("--levels", default="1,2,4,8", help="并发档位，逗号分隔（默认 %(default)s）")
+    ap.add_argument("--per-level", type=int, default=PER_LEVEL, help="每档请求数（默认 %(default)s）")
+    ap.add_argument("--max-tokens", type=int, default=MAX_TOKENS, help="每请求生成上限（默认 %(default)s）")
+    ap.add_argument("--targets", default="service,engine", help="跑哪些端点（默认 %(default)s）")
+    return ap.parse_args(argv)
 
 def _pct(values: list[float], q: float) -> float:
     if not values:
@@ -143,7 +163,15 @@ async def run_level(level: int, target: str, prompt: str) -> dict:
     }
 
 
-async def main() -> None:
+async def main(argv: list[str] | None = None) -> None:
+    global SERVICE, ENGINE, PER_LEVEL, MAX_TOKENS, LEVELS
+    args = _parse_args(argv)
+    SERVICE = args.service.rstrip("/")
+    ENGINE = args.engine.rstrip("/")
+    PER_LEVEL = args.per_level
+    MAX_TOKENS = args.max_tokens
+    LEVELS = tuple(int(x) for x in args.levels.replace(" ", "").split(",") if x)
+    targets = tuple(t.strip() for t in args.targets.split(",") if t.strip())
     s = get_settings()
     prompt = render_prompt(
         [ChatMessage(role="user", content=PROMPT)],
@@ -155,7 +183,7 @@ async def main() -> None:
     print("|---|---|---|---|---|---|---|---|---|---|")
     rows = []
     for level in LEVELS:
-        for target in ("service", "engine"):
+        for target in targets:
             r = await run_level(level, target, prompt)
             rows.append((target, r))
             name = "dshinfer" if target == "service" else "llama-server 原生"
@@ -165,7 +193,10 @@ async def main() -> None:
                 f"{r['ttft_p95'] * 1000:.0f} ms | {r['e2e_p50'] * 1000:.0f} ms | "
                 f"{r['e2e_p95'] * 1000:.0f} ms |"
             )
-    # 服务层相对原生的开销
+    # 服务层相对原生的开销（只跑了单边就跳过）
+    if not ({"service", "engine"} <= set(targets)):
+        return
+
     print("\n| 并发 | 吞吐损失 | TTFT 增加 |")
     print("|---|---|---|")
     for level in LEVELS:

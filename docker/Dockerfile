@@ -47,7 +47,28 @@ RUN set -eux; \
     chmod +x /opt/llama/bin/llama-server; \
     ls -lh /opt/llama/bin/llama-server /opt/llama/lib | head -n 20
 
-# ---------- 阶段 2：运行时镜像 ----------
+# ---------- 阶段 2：构建工程 wheel（hatchling 只活在这一阶段，不进运行时镜像）----------
+# 运行时依赖完全由 docker/requirements.lock（从 uv.lock 导出、每包带 sha256）决定；
+# 这一阶段只把 src/ 打成 wheel，固定 hatchling 版本，产物是纯 Python 文件，没有编译差异。
+FROM ${UBUNTU_BASE} AS wheel
+
+ARG HATCHLING_VERSION=1.33.0
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 python3-venv \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY pyproject.toml README.md ./
+COPY src ./src
+
+RUN python3 -m venv /build-venv \
+ && /build-venv/bin/pip install --no-cache-dir --upgrade pip \
+ && /build-venv/bin/pip install --no-cache-dir "hatchling==${HATCHLING_VERSION}" \
+ && /build-venv/bin/pip wheel --no-deps --no-build-isolation --no-cache-dir -w /wheels . \
+ && ls -l /wheels
+
+# ---------- 阶段 3：运行时镜像 ----------
 FROM ${UBUNTU_BASE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -66,18 +87,29 @@ RUN apt-get update \
 COPY --from=engine /opt/llama /opt/llama
 
 WORKDIR /app
-COPY pyproject.toml README.md ./
-COPY src ./src
 
-# 装进独立 venv：不污染系统 python，构建完可以直接 rm 掉 pip 缓存
-# [tui]：终端面板（Textual）。容器里也要能看盘，所以默认装进镜像；
-# 不想要就在构建时加 --build-arg TUI_EXTRA= 。
-ARG TUI_EXTRA="[tui]"
+# 运行时依赖：按 docker/requirements.lock 安装（uv.lock 导出、每包带 sha256）。
+# 重新生成（改了 pyproject.toml / uv.lock 之后）：
+#   uv export --frozen --no-dev --extra tui --format requirements.txt \
+#       --no-header --no-emit-project -o docker/requirements.lock
+# --require-hashes：包内容与锁不一致（版本被换 / 镜像源不同 / 供应链投毒）会直接构建失败，
+# 这就是「uv 依赖锁定」在镜像里的落点：同一份 lock 永远装出同一套版本。
+COPY docker/requirements.lock /tmp/requirements.lock
 RUN python3 -m venv /opt/venv \
- && /opt/venv/bin/pip install --upgrade pip setuptools wheel \
- && /opt/venv/bin/pip install ".${TUI_EXTRA}" \
+ && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
+ && /opt/venv/bin/pip install --no-cache-dir --require-hashes -r /tmp/requirements.lock \
+ && rm -f /tmp/requirements.lock
+
+# 工程本体：wheel 来自 wheel 阶段，--no-deps 保证不会再解析或升级任何依赖
+COPY --from=wheel /wheels /tmp/wheels
+RUN /opt/venv/bin/pip install --no-cache-dir --no-deps /tmp/wheels/dshinfer-*.whl \
+ && rm -rf /tmp/wheels \
  && /opt/venv/bin/python -c "import dshinfer, fastapi, httpx; print('dshinfer import ok')" \
  && /opt/venv/bin/python -c "import dshinfer.tui; print('dshinfer.tui import ok')"
+
+# 版本自证：镜像里记录实际装了什么（docker exec dshinfer cat /app/runtime/pip-freeze.txt）
+COPY docker/requirements.lock /app/runtime/requirements.lock
+RUN /opt/venv/bin/pip freeze --all > /app/runtime/pip-freeze.txt
 
 # chat template 随镜像走（原文件在 D:\llm\runtime\chat_template.jinja，8908 B），
 # 需要换模型时优先用 compose 的卷覆盖 /app/runtime/chat_template.jinja

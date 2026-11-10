@@ -39,7 +39,8 @@
 ## 3. 本仓库新增了什么（全部增量，不动 src/）
 
 ```
-docker/Dockerfile            单容器镜像：ubuntu:24.04 + python3.12 + b12202 的 Linux CUDA 12.8 引擎
+docker/Dockerfile            单容器镜像：ubuntu:24.04 + python3.12 + b12202 的 Linux CUDA 12.8 引擎（三阶段）
+docker/requirements.lock     依赖锁：uv.lock 导出、44 个包全带 sha256，镜像按它 + --require-hashes 安装
 docker/compose.yaml          GPU 预留 + 权重只读卷 + env 与 .env 逐条对齐 + healthcheck
 docker/chat_template.jinja   从 D:\llm\runtime\chat_template.jinja 复制的 8908 B 模板
 docker/compose.wsl.yaml      WSL2 覆盖层：/dev/dxg 直通、ext4 权重路径、32K 上下文默认值
@@ -85,7 +86,7 @@ docker compose -f docker/compose.yaml logs -f
 # 4) 冒烟
 curl http://127.0.0.1:8000/healthz
 curl http://127.0.0.1:8000/v1/models
-docker exec dshinfer nvidia-smi          # 看显存是否 6.7 GB 左右
+docker exec dshinfer /usr/lib/wsl/lib/nvidia-smi   # 看显存（镜像里没有 nvidia-smi 进 PATH）
 ```
 
 **没有 Docker 也想先验证"引擎进容器"这条路**：直接跑官方镜像，你的服务留在宿主机
@@ -180,9 +181,9 @@ services:
 - [ ] `docker run --rm --gpus all ubuntu:24.04 nvidia-smi` 能看到 4060 Laptop
 - [ ] `/healthz` 返回 `{"status":"ok",...}`，且 `engine` 字段到最后是 ready（不是 loading）
 - [ ] `/v1/chat/completions` 流式能出字，首 token 时间与裸机同量级（差 <100 ms）
-- [ ] `docker exec dshinfer nvidia-smi` 显存 ≈ 6.7 GB（64K）或 ≈ 6.1 GB（32K）
+- [ ] `docker exec dshinfer /usr/lib/wsl/lib/nvidia-smi` 显存 ≈ 6.7 GB（64K）或 ≈ 6.0 GB（32K）
 - [ ] 对照压测：改 `scripts/bench_load.py` 的 `SERVICE`/`ENGINE` 常量指向容器端口，
-      与 `docs/perf.md` 的 1/2/4/8 并发档位逐项比
+      与 `docs/perf.md` 的 1/2/4/8 并发档位逐项比（现成命令：`docker exec -i dshinfer /opt/venv/bin/python - < scripts/bench_load.py`）
 - [ ] `docker compose down` 后宿主机 `nvidia-smi` 不残留 llama-server
 
 ## 9. 没验证的部分（照实说）
@@ -325,11 +326,10 @@ docker.io 29.1.3、容器内 llama.cpp build 12202 (CUDA 12.8)、RTX 4060 Laptop
 | 32,768 | **40.4 t/s** | 6,001 MiB |
 | 65,536 | **26.3 t/s** | 6,183 MiB |
 
-读法：
+读法（2026-11-10 归因后修正，详见 §16）：
 - 8K～32K 之间速度基本平（都 ≈ 40 t/s，和 bench 的 41–42 一致），**32K 是免费的**；
-- 一步跨到 64K，生成速度掉 35%（40.4 → 26.3），因为 64K 的 KV 让每步的读取量和图尺寸都上了一个台阶；
-- 这不是容器造成的：perf.md 里 43 t/s 那组数字是 `llama-bench` 在默认小上下文下测的，换成 64K 的 server 在原生 Windows 上同样会掉。
-- `-np`（slot 数）在 kv_unified 下**不花钱**：`-np 1` 与 `-np 4` 实测 26.24 与 26.30 t/s，64K 的代价与 slot 数无关。
+- 表里 65,536 那行 26.3 t/s **不是上下文的代价**：是 llama.cpp 的 `--fit` 自动降配——它发现 8 GB 装不下 64K 的全量 offload，就把 34 层里的 4 层悄悄留在 CPU（日志 `offloaded 30/34 layers to GPU`），而 `/props` 里 `n_ctx` 依旧是 65536、没有任何报错。把 `--fit` 关掉后 64K 短上下文回到 **40.6 t/s**、显存 6,759 MiB。
+- `-np`（slot 数）在 kv_unified 下不花钱：64K 下 `-np 1` / `-np 4` = 26.8 / 27.1 t/s（两个都被 fit 拖着）；关 fit 后都是 42。
 - 64K 下换 f16 KV：20.5 t/s（更慢）；`-fa off` + 64K 直接 `failed to create context`（OOM）→ **q8_0 KV + FA 是 8 GB 上跑 64K 的唯一可行组合**。
 
 ### 11.3 那条 Flash Attention 警告怎么读
@@ -377,7 +377,7 @@ environment:
   DSHINFER_N_CTX: "32768"   # 32K：40 t/s，显存 6.0 GB，留 2 GB 给 Windows 桌面
 ```
 
-确实需要长上下文时再切 65536，代价是生成速度 −35%：
+确实需要长上下文时再切 65536。**注意**：`--fit` 已默认关闭（`DSHINFER_FIT=false`，见 §16），所以切 64K 不再掉速；代价只有显存从 6.0 GB 涨到 6.76 GB（桌面还要占 0.5–1 GB，8 GB 卡会比较紧）：
 
 ```bash
 DSHINFER_N_CTX=65536 docker compose -f docker/compose.yaml -f docker/compose.wsl.yaml up -d --force-recreate
@@ -540,3 +540,93 @@ uv run --extra tui python -m dshinfer.tui --monitor  # 跳过向导直接看盘
 ```
 
 容器里同样能跑（见 docs/tui.md 的 docker/ops.sh tui）。
+
+## 15. 依赖锁定：uv.lock → docker/requirements.lock（构建可复现）
+
+旧镜像用 `pip install ".[tui]"`，等价于「构建那一刻 PyPI 上是什么就装什么」——同一份代码隔两周重建，
+fastapi / pydantic / textual 的版本就可能变了：出问题无法回溯，也答不出「这个镜像到底装了哪个版本」。
+
+现在拆成三段，锁点在 `docker/Dockerfile`：
+
+| 阶段 | 做什么 | 为什么 |
+| --- | --- | --- |
+| 阶段 1 `engine` | 下官方 llama.cpp b12202 的 Linux CUDA 12.8 包 | 和 Windows 侧同 build，perf.md 的调优数据继续有效 |
+| 阶段 2 `wheel` | 固定 `hatchling==1.33.0`，把 `src/` 打成 `dshinfer-0.1.0-py3-none-any.whl` | 构建期工具不进运行时镜像；工程本体是纯 Python，产物跨机器一致 |
+| 阶段 3 运行时 | `pip install --require-hashes -r docker/requirements.lock`，再 `pip install --no-deps` 装 wheel | 依赖完全由锁文件决定，版本被换 / 镜像源不同会直接构建失败 |
+
+`docker/requirements.lock` 由 uv 从 `uv.lock` 导出（**44 个包 / 721 行，每个包都带 sha256**）：
+
+```bash
+uv export --frozen --no-dev --extra tui --format requirements.txt \
+    --no-header --no-emit-project -o docker/requirements.lock
+```
+
+几个要点：
+
+- **改了 `pyproject.toml` / `uv.lock` 必须重新导出**，否则构建会在 pip 解析时失败——这是故意留的闸门。
+- 锁里不含 dev 依赖（pytest 等），但含 `[tui]` 的 textual/rich：**容器里一定能看盘**；
+  代价是不再支持「构建时去掉 TUI」，原来那个 `--build-arg TUI_EXTRA=` 已删除。
+- `--no-deps` 装 wheel：保证 pip 不会再顺手升级或降级任何依赖。
+- 版本自证留在镜像里，排查时直接看：
+
+```bash
+docker exec dshinfer head -n 5 /app/runtime/pip-freeze.txt
+docker exec dshinfer /opt/venv/bin/pip check
+```
+
+## 16. 构建/运行验证记录（2026-11-10）与 `--fit` 那个坑
+
+### 16.1 镜像自证：确实按锁装的
+
+| 项目 | 结果 |
+|---|---|
+| 构建 | `docker build -f docker/Dockerfile -t dshinfer:local .` → `edddf33417ed…`（加 `-fit` 逻辑后重建 `ef997c3b4db0`），2.66 GB |
+| 锁一致性 | 容器内 `/app/runtime/requirements.lock` **md5 = d9180a821d3bbfd15c51f44f9eb2dfe5**（54,309 B），与宿主 `docker/requirements.lock` 完全一致 → `--require-hashes` 用的就是这份 |
+| 版本快照 | `/app/runtime/pip-freeze.txt` 39 行：`annotated-doc==0.0.5`、`anyio==4.16.0`、`fastapi==0.162.2`、`textual==8.2.8` … |
+| 引擎 | `/healthz` → `load_seconds 7–19`、`n_slots=4, n_ctx_slot=32768, kv_unified=true` |
+
+### 16.2 容器内 TUI 验证（P0 的验收项）
+
+- **headless**：`docker exec -i dshinfer /opt/venv/bin/python - < v_tui_container.py`，
+  `app.run_test(size=(150,44))` → `errors=[]`；三套主题循环、`space` 冻结、1–7 视图切换、
+  NVML 走 `nvml:linux` 读到 4060 / 8188 MiB，全部正常。
+- **真 pty**（不是 mock）：
+
+```bash
+docker exec dshinfer sh -lc 'cd /app && timeout 8 script -qec   "/opt/venv/bin/python -m dshinfer.tui --monitor" /tmp/tui.ts >/dev/null 2>&1; echo EXIT=$?'
+# EXIT=124（超时被杀 = 界面一直在跑），/tmp/tui.ts 57,548 B，grep -c Traceback = 0
+```
+
+### 16.3 `--fit` 自动降配：那个「64K 掉速 35%」的真凶
+
+我们这份构建（b12202）**默认开启 `--fit`**：加载前先花 4.8 秒试算，把参数「塞进」显存。
+塞不下时它会**少 offload 几层到 GPU**，而 `/props` 里 `n_ctx` 依旧、日志里也不报错——于是看起来就像「上下文一长就变慢」。
+
+原生 Windows `llama-server`（Q4_K_M、q8_0 KV、`-np 4 --kv-unified`、短 prompt 117 token、生成 128）：
+
+| `-c` | `--fit` 默认（on） | `-fit off` |
+|---:|---:|---:|
+| 32,768 | 42.00 t/s | 42.06 t/s |
+| 40,960 | 41.91 t/s | — |
+| 49,152 | 32.00 t/s | — |
+| 57,344 | 26.90 t/s | — |
+| 65,536 | **26.78 t/s** | **42.05 t/s** |
+
+排除法（都是同一份权重、同一天）：
+
+- **不是 slot 数**：64K 下 `-np 1` = 26.80、`-np 4` = 27.08；
+- **不是显存压力**：全程 6.0–6.2 GB / 8.19 GB，没有溢出到宿主；换 4.31 GB 的 Q3_K_M 也只是 48.67（快是量化小，不是不掉级）；
+- **不是深度**：短 prompt 117 token 就已经掉 36%，此时 KV 里只有 117 个 token；
+- **是 `--fit`**：`-lv 5` 日志能看到它的搜索轨迹
+  `offloaded 34/34 → 0/34 → 34/34 → 31/34 → 29/34 → 30/34（最终）`，
+  也就是 4 层留在 CPU 上跑；关掉 `-fit` 后显存涨到 6,727 MiB、速度回到 42。
+- **容器内一致**（同一份 Linux CUDA 构建、64K/q8/np4）：短 prompt **40.63 / 40.78 t/s**、
+  27,098 token 深度 **29.75 t/s**（fit 打开时是 25.4–26.4 与 20.9–21.1）。`grep -c fit` 引擎日志 = 0。
+
+处置：`config.py` 新增 `fit: bool = False`（环境变量 `DSHINFER_FIT`），engine 在其为假时追加 `-fit off`。
+理由：`n_ctx` 是我们显式钉死的参数，装不下就该显式失败，而不是悄悄把 4 层踢回 CPU 再假装一切正常。
+显存更小的卡若加载 OOM，把它设回 `true` 即可恢复旧的「自动降级」行为。
+
+> 顺带修正本文档旧结论：§11.2 的「64K 掉 35%」、§11.5 的「切 64K 要付 −35% 速度」都是 `--fit` 的副作用，不是上下文本身的代价。
+> 深度本身的代价见 `docs/perf.md` §14：64K 填满时约 −22%（线性，来自 KV 字节带宽）。
+

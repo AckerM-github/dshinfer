@@ -107,6 +107,10 @@ class LlamaServerEngine:
         ]
         if self._s.n_threads > 0:
             cmd += ["-t", str(self._s.n_threads)]
+        # --fit 会自动降配（少 offload 几层）且不留任何痕迹，等于把「装不下」
+        # 伪装成「就这么慢」。n_ctx 是显式配置，宁可加载失败也别偷偷降级。
+        if not self._s.fit:
+            cmd += ["-fit", "off"]
         # 统一 KV 池：让 n_parallel 个 slot 共享 n_ctx 总额，而不是各预留一份。
         # 这是 llama.cpp 里最接近 PagedAttention"按需分配"的东西。
         if self._s.kv_unified:
