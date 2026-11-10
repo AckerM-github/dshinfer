@@ -24,7 +24,7 @@ ORIG_ARGS=("$@")
 SELF_SUM=$(sha256sum "$0" 2>/dev/null | cut -d' ' -f1 || true)
 
 REPO_DIR="${REPO_DIR:-$HOME/infer}"
-SOURCE="${SOURCE:-/mnt/d/llm/infer}"
+SOURCE="${SOURCE:-https://github.com/AckerM-github/dshinfer.git}"
 BRANCH="${BRANCH:-main}"
 DO_BUILD="${DEPLOY_BUILD:-1}"
 DO_UP="${DEPLOY_UP:-1}"

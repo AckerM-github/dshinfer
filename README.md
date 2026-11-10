@@ -32,6 +32,10 @@ uv run pytest -q                     # 7 个测试，ASGI 直连不占端口
 uv run uvicorn dshinfer.api:app --port 8000
 ```
 
+日常运维走 `scripts\ops.ps1 <命令>`（Windows 原生）或 `bash docker/ops.sh <命令>`（容器/云），
+两边子命令同名同义：`up / down / status / check / logs / bench / models / tui / verify`。
+三种形态的完整对照与隔离约束见 [docs/deploy.md](docs/deploy.md)。
+
 ```powershell
 curl.exe -s http://127.0.0.1:8000/healthz
 curl.exe -s -X POST http://127.0.0.1:8000/v1/chat/completions `
@@ -47,6 +51,7 @@ curl.exe -s -X POST http://127.0.0.1:8000/v1/chat/completions `
 | `GET /v1/models` | 列出模型（OpenAI 客户端启动时会调） |
 | `GET /healthz` | 存活 + 引擎状态 |
 | `GET /admin/stats` | 在飞请求数、排队数、并发上限、引擎健康 |
+| `GET /admin/config` | 生效配置的契约键（上下文/KV/并发/权重尺寸），给两端一致性自检用 |
 | `GET /admin/traces` | 最近 N 条请求的时间线摘要（新的在前） |
 | `GET /admin/traces/{id}` | 单条请求的完整时间线：每个打点 + 派生 span |
 | `GET /metrics` | Prometheus：请求数、令牌数、TTFT、端到端延迟、在飞、队列深度 |
@@ -54,6 +59,11 @@ curl.exe -s -X POST http://127.0.0.1:8000/v1/chat/completions `
 请求头 `X-Request-Id` 可自带，响应头会回显；非流式响应还带 `Server-Timing: queue;dur=…, ttft;dur=…, total;dur=…`。
 
 ## 配置（环境变量前缀 `DSHINFER_`）
+
+调优参数的默认值只有一处：`config/base.env`（容器与 Windows 原生都读它）。
+容器专属路径在 `config/docker.env`，本机路径在 `.env`（模板 `.env.example`）。
+优先级：进程环境变量 > 本机 `.env` > `config/base.env` > `config.py` 的平台默认值。
+下表是字段说明；要改默认值请改 `config/base.env`，不要再抄到别处（有测试守着）。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|

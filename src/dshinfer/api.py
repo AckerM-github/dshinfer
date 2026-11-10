@@ -6,8 +6,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import orjson
 import structlog
@@ -100,6 +103,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/healthz")
     async def healthz():
         return {"status": "ok", "engine": await manager.health()}
+
+    @app.get("/admin/config")
+    async def admin_config():
+        """生效配置的机器可读视图：两端一致性比对入口（scripts/verify_env.py）。"""
+        # 只报跨机器可比的键：路径在三种形态里天然不同，比它们只会制造假差异。
+        try:
+            gguf_bytes = os.path.getsize(s.gguf_path)
+        except OSError:
+            gguf_bytes = None
+        return {
+            "engine": s.engine,
+            "model_name": s.model_name,
+            "gguf_file": Path(s.gguf_path).name,
+            "gguf_bytes": gguf_bytes,
+            "n_ctx": s.n_ctx,
+            "cache_type_k": s.cache_type_k,
+            "cache_type_v": s.cache_type_v,
+            "n_parallel": s.n_parallel,
+            "max_concurrency": s.max_concurrency,
+            "kv_unified": s.kv_unified,
+            "n_batch": s.n_batch,
+            "n_ubatch": s.n_ubatch,
+            "flash_attn": s.flash_attn,
+            "slot_pinning": s.slot_pinning,
+            "fit": s.fit,
+            "n_gpu_layers": s.n_gpu_layers,
+            "enable_thinking": s.enable_thinking,
+            "platform": sys.platform,
+        }
 
     @app.get("/v1/models")
     async def list_models():

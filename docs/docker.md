@@ -115,7 +115,7 @@ docker run --rm --gpus all -p 127.0.0.1:8124:8124 \
 | 6 | `docker build` 拉 GitHub release 慢/超时 | 卡在 curl | 加 `--build-arg RELEASE_BASE=<镜像或内网地址>`；或预下载两个 tar.gz 用 `COPY` |
 | 7 | 忘了 `scripts/stop.ps1` | 宿主机引擎还在，显存/端口冲突 | 先停宿主，再 up；容器 `engine_port` 是容器内 8124，不是映射端口 |
 | 8 | 孤儿 llama-server | `docker stop` 后 `nvidia-smi` 还占显存 | 已用 tini + `stop_grace_period: 30s`；异常时 `docker kill` + `docker compose down` |
-| 9 | `.env` 没进镜像（故意的） | 容器里配置和宿主不一致 | 配置全部由 `docker/compose.yaml` 的 `environment` 给；改配置改 compose 或 `.env` + `env_file:` |
+| 9 | 配置曾有两份（compose 手抄 .env） | 容器里的调优值和宿主悄悄不一致 | 已收敛成单源：调优值只在 `config/base.env`，容器路径在 `config/docker.env`，两边都通过 `env_file` / 镜像内副本读同一份；`bash docker/ops.sh verify` 逐键比对，见 `docs/deploy.md` |
 
 **权重预热到 docker 卷**（解决坑 2，一次性 5.24 GB 拷贝）：
 

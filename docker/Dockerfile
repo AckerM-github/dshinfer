@@ -109,6 +109,11 @@ RUN /opt/venv/bin/pip install --no-cache-dir --no-deps /tmp/wheels/dshinfer-*.wh
 
 # 版本自证：镜像里记录实际装了什么（docker exec dshinfer cat /app/runtime/pip-freeze.txt）
 COPY docker/requirements.lock /app/runtime/requirements.lock
+
+# 配置契约：与仓库里的 config/*.env 是同一份文件，容器与 Windows 原生读同一套默认值。
+# config.py 的 _env_files() 在镜像里优先读 /app/runtime/base.env 与 /app/runtime/docker.env。
+COPY config/base.env /app/runtime/base.env
+COPY config/docker.env /app/runtime/docker.env
 RUN /opt/venv/bin/pip freeze --all > /app/runtime/pip-freeze.txt
 
 # chat template 随镜像走（原文件在 D:\llm\runtime\chat_template.jinja，8908 B），

@@ -17,6 +17,7 @@
 #   bench [args]    停服务 → 一次性容器跑 llama-bench → 自动拉起服务
 #   models          打印权重清单并校验目标目录里的文件
 #   shell           进入容器 bash
+#   verify          两端一致性自检（容器 vs 宿主 /admin/config）
 #   tui             容器里打开终端面板（Textual，需要 TTY；q 退出）
 set -eo pipefail
 
@@ -379,8 +380,39 @@ cmd_tui() {
     python -m dshinfer.tui --monitor "$@"
 }
 
+# ---------------------------------------------------------------- verify
+
+# two-form config check: collect /admin/config inside the container, collect it again
+# from the host through the port mapping, then diff the contract keys.
+# Same source tree can still drift at runtime; this is the check that catches it.
+cmd_verify() {
+  local out="${1:-.verify}"
+  local stamp
+  stamp=$(date +%Y%m%d-%H%M%S)
+  mkdir -p "$out"
+  [ -f scripts/verify_env.py ] || die "scripts/verify_env.py 不在当前 checkout（$(pwd)）里"
+  is_up || die "容器 $CONTAINER 没在跑：先 bash docker/ops.sh up"
+
+  head1 "容器内采集 /admin/config"
+  local cfile="/tmp/verify-$stamp.json"
+  d exec -i "$CONTAINER" /opt/venv/bin/python - --base http://127.0.0.1:8000 --json-out "$cfile" < scripts/verify_env.py || die "容器内采集失败"
+  d cp "$CONTAINER:$cfile" "$out/container-$stamp.json"
+  d exec "$CONTAINER" rm -f "$cfile"
+
+  head1 "宿主侧采集（走 127.0.0.1:8000 端口映射）"
+  local hfile="$out/host-$stamp.json"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 scripts/verify_env.py --base "$HTTP" --json-out "$hfile" --quiet || true
+  else
+    die "宿主没有 python3，无法采集宿主侧配置（Windows 原生用 scripts/ops.ps1 verify）"
+  fi
+
+  head1 "比对"
+  python3 scripts/verify_env.py --compare "$hfile" "$out/container-$stamp.json"
+}
+
 usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-help}" in
@@ -396,6 +428,7 @@ case "${1:-help}" in
   models)  cmd_models ;;
   shell)   cmd_shell ;;
   tui)     shift; cmd_tui "$@" ;;
+  verify)  shift; cmd_verify "$@" ;;
   help|-h|--help) usage ;;
   *) bad "未知命令：$1"; echo; usage; exit 2 ;;
 esac

@@ -6,6 +6,11 @@
 #
 # 前置：Docker Desktop（WSL2 后端）或 Linux + nvidia-container-toolkit，
 #       并且下面 GPU 段能被识别：docker run --rm --gpus all ubuntu nvidia-smi
+#
+# 配置只有一个事实来源：
+#   config/base.env    调优参数（与 Windows 原生跑共用，路径与机器无关）
+#   config/docker.env  容器内路径
+# 想临时改某一项：在下面写 environment:（它对 env_file 有更高优先级）。
 name: dshinfer
 
 services:
@@ -28,39 +33,21 @@ services:
       - "127.0.0.1:8000:8000"
 
     volumes:
-      # 权重永远不进镜像层：5.24 GB，且实验期会换 Q4_K_M / Q3_K_M
-      # 注意 Windows 路径经 WSL2 走 9p（/mnt/d），mmap 冷加载会明显变慢，详见 docs/docker.md
-      - "${MODELS_DIR:-D:/llm/models/gguf}:/models:ro"
+      # 权重永远不进镜像层：5.24 GB，且实验期会换 Q4_K_M / Q3_K_M。
+      # 这里是"宿主机上的哪个目录挂到 /models"，属于机器差异：
+      #   WSL    → compose.wsl.yaml 里指定 /home/linc/models（ext4，别用 /mnt/d 的 9p）
+      #   云上    → MODELS_DIR=/srv/models
+      #   不设时用 /models 占位，权重检查会明确报"目录为空"
+      - "${MODELS_DIR:-/models}:/models:ro"
       # 引擎日志（llama-server 的 stdout/stderr 落这里）
       - dshinfer-logs:/var/log/dshinfer
 
-    environment:
-      # —— 与 D:\llm\infer\.env 逐条对齐，容器内路径换成 /models ——
-      DSHINFER_ENGINE: llamacpp
-      DSHINFER_MODELS_DIR: /models
-      DSHINFER_GGUF_PATH: /models/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q4_K_M.gguf
-      DSHINFER_LLAMA_SERVER_PATH: /opt/llama/bin/llama-server
-      DSHINFER_CHAT_TEMPLATE_PATH: /app/runtime/chat_template.jinja
-      DSHINFER_ENGINE_LOG_PATH: /var/log/dshinfer/llama-server.log
-      DSHINFER_HOST: 0.0.0.0
-      DSHINFER_PORT: "8000"
-      # 64K 上下文 + q8_0 KV：本机实测 6,727 MiB / 8,188 MiB，容器里没有额外余量，
-      # 若 OOM 先把 N_CTX 降到 32768（或换 Q3_K_M）
-      DSHINFER_N_CTX: "65536"
-      DSHINFER_CACHE_TYPE_K: q8_0
-      DSHINFER_CACHE_TYPE_V: q8_0
-      DSHINFER_N_PARALLEL: "4"
-      DSHINFER_MAX_CONCURRENCY: "4"
-      DSHINFER_KV_UNIFIED: "true"
-      DSHINFER_N_BATCH: "2048"
-      DSHINFER_N_UBATCH: "1024"
-      DSHINFER_FLASH_ATTN: "true"
-      DSHINFER_SLOT_PINNING: "true"
-      DSHINFER_N_GPU_LAYERS: "-1"
-      DSHINFER_ENGINE_START_TIMEOUT_S: "300"
-      DSHINFER_ENABLE_THINKING: "false"
+    # 配置来源：调优参数 + 容器路径，两段分开维护
+    env_file:
+      - ../config/base.env
+      - ../config/docker.env
 
-    # —— GPU —— 
+    # —— GPU ——
     # compose v2 会识别 deploy.resources.reservations.devices（不需要 swarm）
     deploy:
       resources:
@@ -82,5 +69,6 @@ volumes:
   dshinfer-logs:
 
 # 想看模型是否真的吃满显存：docker exec dshinfer nvidia-smi
-# 想直连引擎做对照压测：compose 里再暴露引擎端口（默认只绑 127.0.0.1:8124，容器内），
-# 加一行 "127.0.0.1:8124:8124" 即可，然后改 scripts/bench_load.py 的 ENGINE 常量。
+# 想核对容器内生效的配置契约：docker exec dshinfer python - /models 见 GET /admin/config
+# 想直连引擎做对照压测：compose 里再暴露引擎端口（默认只在容器内 127.0.0.1:8124），
+# 加一行 "127.0.0.1:8124:8124" 即可。

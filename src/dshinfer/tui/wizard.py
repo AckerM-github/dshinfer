@@ -277,7 +277,7 @@ class WizardApp(App[Preset | None]):
         return [
             self._label("模型文件夹"),
             self._note("容器里它是 /models 的宿主侧来源；服务层只扫这一层的 *.gguf"),
-            Input(value=self.preset.models_dir, id="folder", placeholder="例如 D:\\llm\\models\\gguf"),
+            Input(value=self.preset.models_dir, id="folder", placeholder="模型目录的绝对路径"),
         ]
 
     def _submit_folder(self, raw: str) -> None:
