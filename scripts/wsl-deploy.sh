@@ -10,7 +10,8 @@
 #   --fresh          备份现有目录后重新 clone（首次迁移用；旧目录改名为 <dir>.bak.<时间戳>）
 #   --no-build       跳过镜像构建，只重启容器
 #   --no-up          只同步代码，不动容器
-#   --source PATH    首次 clone 的来源（默认 /mnt/d/llm/infer，也可以填 GitHub 地址）
+#   --source PATH    首次 clone 的来源（默认 GitHub HTTPS 仓库；断网时可填 /mnt/d/llm/infer ——
+#                    那只是 WSL 自动挂载的 D 盘 9p，不属于本项目的依赖）
 #   --branch NAME    分支（默认 main）
 #   --dir PATH       目标目录（默认 $HOME/infer）
 #   -h, --help       显示本帮助
