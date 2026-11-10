@@ -165,3 +165,12 @@ def test_verify_env_is_stdlib_only():
     assert "urllib" in text
     for banned in ("import requests", "import httpx"):
         assert banned not in text, "verify_env.py 要能在镜像与宿主两端裸跑，只能用标准库"
+def test_powershell_scripts_are_safe_for_ps51():
+    """PowerShell 5.1 在无 BOM 时按 ANSI(GBK) 解码 .ps1，中文注释会把引号吃掉。"""
+    for path in sorted(ROOT.glob('scripts/*.ps1')):
+        raw = path.read_bytes()
+        has_bom = raw.startswith(b"\xef\xbb\xbf")
+        text = raw.decode("utf-8-sig")
+        assert has_bom or text.isascii(), (
+            str(path) + " 含非 ASCII 但没 BOM，powershell.exe 5.1 会解析失败"
+        )

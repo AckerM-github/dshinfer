@@ -20,6 +20,9 @@ eval/results/
 eval/latest.json
 *.log
 
+# 两端一致性自检产物（scripts/verify_env.py / ops.sh verify）
+.verify/
+
 # OS
 .DS_Store
 Thumbs.db

@@ -123,6 +123,15 @@ python3 scripts/verify_env.py --compare a.json b.json     # 0 一致 / 1 有差�
 脚本只用标准库 `urllib`，所以容器里的 `/opt/venv/bin/python` 与宿主裸 `python3` 都能跑，
 不需要装任何依赖。
 
+注意在 WSL 单机上，`ops.sh verify` 的「宿主侧」是走 `127.0.0.1:8000` 端口映射采的，
+拿到的仍是同一个容器 —— 它证明的是「同一份配置经两条路径读出来完全一样」。
+要真正跨形态比对（Windows 原生 ↔ 容器 ↔ 云），先在 Windows 上跑
+`powershell -File scripts\ops.ps1 verify` 生成 `.verify\host-*.json`，再
+`python3 scripts/verify_env.py --compare 两份文件`。
+2026-11-10 实测（同一份源码，Windows 原生 64K ↔ Linux 容器 64K，各跑一次采集）：
+`verify_env.py --compare` 结果 **17 个契约键完全一致**，退出码 0。
+也就是说除了 GPU 供给方式，两端跑起来的配置契约没有任何差异。
+
 ## 5. 清白性验证：容器确实不依赖 Windows 路径
 
 「代码里没有 `D:\`」是静态检查（`tests/test_isolation.py`）；要证明**构建与运行**也不需要 D 盘，
@@ -189,3 +198,22 @@ sudo unshare -m --propagation private bash -c '
 
 相关文档：`docs/docker.md`（镜像构建、WSL 安装、性能记录与 `--fit` 那个坑）、
 `docs/perf.md`（并发与上下文实测）、`docs/ops.md`（运维细节）。
+
+## 9. ops 脚本的两个坑（2026-11-10 实测踩到并修掉）
+
+**ops.sh：容器不存在时静默退出。** `container_models_dir()` 里 `docker inspect` 失败，
+配合 pipefail + `set -e`，`MODELS_DIR=$(...)` 赋值失败会让整个脚本一个字节都不打印就 exit 1。
+现在函数末尾与调用处都带 `|| true`，`up --build` 在「先 down 再 up」的干净路径上才能跑通。
+
+**ops.ps1：.ps1 必须纯 ASCII，或带 UTF-8 BOM。** powershell.exe 5.1 读无 BOM 的 .ps1 时按
+ANSI(GBK) 解码，中文注释/字符串的字节会把引号吃掉，报 `Missing closing )` 或
+`The string is missing the terminator`，而且行号指向别处。现在 ops.ps1 是 ASCII 内容 +
+UTF-8 BOM，`tests/test_isolation.py::test_powershell_scripts_are_safe_for_ps51` 守着。
+
+**ops.ps1：参数不要叫 `$Args`。** 它是自动变量；`function Invoke-Repo([string[]]$Args)` 会把
+`Invoke-Repo @( ... )` 里除第一个之外的值全吞掉，python 于是没收到参数、直接掉进 REPL ——
+表现为 verify 打印「wrote ...」但文件根本没生成。改名 `$ScriptArgs` 后正常。
+
+顺带两处：`Get-Content models.json -Raw` 要加 `-Encoding UTF8`（文件含中文，GBK 解码会喂给
+ConvertFrom-Json 一个坏串）；权重目录改读 `$env:DSHINFER_MODELS_DIR`，不再写死 D 盘。
+

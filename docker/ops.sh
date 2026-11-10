@@ -52,10 +52,11 @@ d()  { $SUDO docker "$@"; }
 # 权重目录：优先取容器 /models 的实际挂载源 —— 那才是容器真正读的目录。
 # 直接写 $HOME/models 在 sudo 下会变成 /root/models（sudo 重置 HOME），校验就全 MISSING。
 container_models_dir() {
-  d inspect -f '{{range .Mounts}}{{if eq .Destination "/models"}}{{.Source}}{{end}}{{end}}' "$CONTAINER" 2>/dev/null | head -n 1
+  # 容器不存在时 docker inspect 会失败，pipefail 下必须吞掉，否则 set -e 让脚本静默退出
+  d inspect -f '{{range .Mounts}}{{if eq .Destination "/models"}}{{.Source}}{{end}}{{end}}' "$CONTAINER" 2>/dev/null | head -n 1 || true
 }
 if [ -z "${MODELS_DIR:-}" ]; then
-  MODELS_DIR=$(container_models_dir)
+  MODELS_DIR=$(container_models_dir || true)
   [ -n "$MODELS_DIR" ] || MODELS_DIR="$HOME/models"
 fi
 

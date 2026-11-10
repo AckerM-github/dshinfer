@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Position = 0)][string]$Command = 'help',
     [Parameter(Position = 1, ValueFromRemainingArguments = $true)][string[]]$Rest,
     [int]$Port = 8000,
@@ -30,6 +30,9 @@ param(
 $ErrorActionPreference = 'Stop'
 if (-not $InferDir) { $InferDir = Split-Path $PSScriptRoot -Parent }
 $Base = "http://127.0.0.1:$Port"
+# Weights dir: same precedence as the service (env > Windows default), so check
+# inspects the directory the engine actually reads.
+$WeightsDir = if ($env:DSHINFER_MODELS_DIR) { $env:DSHINFER_MODELS_DIR } else { "D:\llm\models\gguf" }
 $EngineLog = Join-Path $RunDir 'llama-server.log'
 $ServiceLog = Join-Path $RunDir 'service.log'
 $WatchdogLog = Join-Path $RunDir 'watchdog.log'
@@ -110,14 +113,14 @@ function cmd_check {
         Row 'OK' ("$i. engine ready, model=" + $h.engine.model)
     } else { $fails++; Row 'FAIL' "$i. engine not ready" }
     $i++
-    $modelsDir = Join-Path 'D:\llm\models\gguf' ''
+    $modelsDir = $WeightsDir
     $ggufs = @(Get-ChildItem -Path $modelsDir -Filter '*.gguf' -ErrorAction SilentlyContinue)
     if ($ggufs.Count -gt 0) { $fails = $fails; Row 'OK' ("$i. weights: " + $ggufs.Count + ' gguf in ' + $modelsDir) } else { $fails++; Row 'FAIL' ("$i. weights dir empty: " + $modelsDir) }
     $i++
     $manifest = Join-Path $InferDir 'models\models.json'
     if (Test-Path $manifest) {
         $bad = @()
-        $spec = Get-Content $manifest -Raw | ConvertFrom-Json
+        $spec = Get-Content $manifest -Raw -Encoding UTF8 | ConvertFrom-Json
         foreach ($entry in $spec.models) {
             if (-not $entry.file) { continue }
             $p = Join-Path $modelsDir $entry.file
@@ -137,7 +140,7 @@ function cmd_check {
     } else { Row 'WARN' "$i. nvidia-smi unavailable" }
     $i++
     if ((Get-ListenPid).Count -gt 0) { Row 'OK' "$i. port $Port owned by a live process" } else { $fails++; Row 'FAIL' "$i. nothing listening on $Port" }
-    Head1 ("结果：{0} 项失败" -f $fails)
+    Head1 ("result: {0} item(s) failed" -f $fails)
     if ($fails -gt 0) { exit 1 }
 }
 
@@ -161,17 +164,20 @@ function cmd_logs([string[]]$Args) {
 
 function cmd_models {
     Head1 'models'
-    $dir = 'D:\llm\models\gguf'
+    $dir = $WeightsDir
     Get-ChildItem -Path $dir -Filter '*.gguf' -ErrorAction SilentlyContinue |
         Sort-Object Length -Descending |
         ForEach-Object { Write-Host ("  {0,-72} {1}" -f $_.Name, (Format-Size $_.Length)) }
 }
 
-function Invoke-Repo([string]$Verb, [string[]]$Args) {
+function Invoke-Repo([string[]]$ScriptArgs) {
+    # $Args is an automatic variable: naming a parameter $Args swallows every
+    # positional value after the first one, so verify/bench/tui silently ran
+    # python with no arguments (it dropped into the REPL).
     $py = Join-Path $InferDir '.venv\Scripts\python.exe'
     Push-Location $InferDir
     try {
-        if (Test-Path $py) { & $py @Args } else { & uv run @Args }
+        if (Test-Path $py) { & $py @ScriptArgs } else { & uv run @ScriptArgs }
     } finally { Pop-Location }
 }
 
@@ -181,7 +187,7 @@ function cmd_verify {
     New-Item -ItemType Directory -Force -Path $out | Out-Null
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $file = Join-Path $out ('host-' + $stamp + '.json')
-    Invoke-Repo '' @('scripts/verify_env.py', '--base', $Base, '--json-out', $file)
+    Invoke-Repo @('scripts/verify_env.py', '--base', $Base, '--json-out', $file)
     Write-Host ("  wrote " + $file)
     Write-Host '  compare with the container report: python scripts/verify_env.py --compare <a.json> <b.json>'
 }
@@ -210,11 +216,11 @@ switch ($Command.ToLower()) {
         Head1 'bench (native)'
         $bench = @('scripts/bench_load.py', '--service', $Base)
         if ($Rest) { $bench += $Rest }
-        Invoke-Repo '' $bench
+        Invoke-Repo $bench
     }
     'tui' {
         Head1 'tui (native)'
-        Invoke-Repo '' @('-m', 'dshinfer.tui', '--url', $Base)
+        Invoke-Repo @('-m', 'dshinfer.tui', '--url', $Base)
     }
     'verify' { cmd_verify }
     'fetch' {
