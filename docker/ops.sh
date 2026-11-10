@@ -342,13 +342,8 @@ cmd_bench() {
 
   trap bench_restore EXIT
 
-  local gpu_opts=()
-  if is_wsl; then
-    gpu_opts=(-v /usr/lib/wsl:/usr/lib/wsl:ro --device /dev/dxg
-              -e LD_LIBRARY_PATH=/usr/lib/wsl/lib:/opt/llama/bin:/opt/llama/lib)
-  else
-    gpu_opts=(--gpus all)
-  fi
+  # 2026-11-10 起 WSL 与云同一套：装了 nvidia-container-toolkit，一律 --gpus all
+  local gpu_opts=(--gpus all)
 
   head1 "llama-bench $BENCH_MODEL ${args[*]}"
   local rc=0
@@ -374,7 +369,7 @@ cmd_shell() { d exec -it "$CONTAINER" bash; }
 # ---------------------------------------------------------------- tui
 
 # 面板必须在容器里跑：引擎的 8014/metrics 只绑容器内的 127.0.0.1，宿主看不到；
-# NVML 也只在容器里挂着（compose.wsl.yaml 把 /usr/lib/wsl 只读挂进去）。
+# NVML 由 nvidia 运行时注入（libnvidia-ml.so.1 在容器默认库路径里，WSL 与云一致）。
 cmd_tui() {
   if [ "$(d inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" != "true" ]; then
     die "容器 $CONTAINER 没在跑：先 bash docker/ops.sh up"

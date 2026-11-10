@@ -214,7 +214,7 @@ moe_summary = {"is_moe": false, ...}
    上一版网页面板写成 `health.engine.ready`，就永远是"引擎未就绪"。
 4. **`n_ctx` 与 `max_context_tokens` 是两个字段**：前者是引擎实跑（容器里被
    `DSHINFER_N_CTX=32768` 覆盖），后者是模型训练上限 262144。面板主显前者，后者放括号里。
-5. **容器里资源是只读挂进去的**：`/models:ro`、`/usr/lib/wsl:ro`。面板只读它们，
+5. **容器里资源是只读挂进去的**：`/models:ro`（权重）、日志卷（可写）。面板只读它们，
    不需要任何写权限；日志卷是可写的。
 6. **容器内路径要自适应**：`preset.py` 用「`/models` 存在且 `/opt/llama/bin/llama-server` 存在」
    判断自己在镜像里，默认值随之变成容器路径；宿主上仍是 `~/models` / `D:\\llm\\models\\gguf`。

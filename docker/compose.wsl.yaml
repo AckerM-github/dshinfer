@@ -1,34 +1,25 @@
-# WSL2 覆盖层：本机（Ubuntu 26.04 / WSL 3.0.3 / 无 nvidia-container-toolkit）用法
+# WSL2 主机配置（2026-11-10 起：GPU 通路与云完全同构，不再手工塞驱动）
 #
-#   git clone /mnt/d/llm/infer ~/infer && cd ~/infer       # 或用 scripts/wsl-deploy.sh --fresh
-#   bash scripts/wsl-deploy.sh                              # = pull + build + up + 等 /healthz
-# 手工等价：
-#   docker compose -f docker/compose.yaml -f docker/compose.wsl.yaml build
-#   docker compose -f docker/compose.yaml -f docker/compose.wsl.yaml up -d
+#   一次性准备（docs/docker.md 10.2 / 10.3）：
+#     sudo apt install -y docker.io docker-compose-v2
+#     sudo apt install -y nvidia-container-toolkit          # NVIDIA 官方源，实测 1.20.2 在 Ubuntu 26.04 可用
+#     sudo nvidia-ctk runtime configure --runtime=docker
+#     sudo systemctl restart docker
 #
-# 为什么不用 --gpus all：Ubuntu 26.04 源里没有 nvidia-container-toolkit（NVIDIA 官方源只到 24.04 noble）。
-# WSL2 的 GPU 通路本质是 /dev/dxg + 宿主的 /usr/lib/wsl/lib/libcuda.so.1，手工塞进容器即可。
+#   之后：bash scripts/wsl-deploy.sh        # = git 同步 + build + up + 等 /healthz
+#   等价手工：docker compose -f docker/compose.yaml -f docker/compose.wsl.yaml up -d
+#
+# 这个文件只写「WSL 这台机器和云上那台机器不一样的两件事」：
+#   1. 权重目录：WSL 放 ext4 的 /home/linc/models（/mnt/d 是 9p，mmap 慢 5-10 倍）；云上一般 /srv/models
+#   2. 上下文默认值：8 GB 显存放 32K（40 t/s、显存 6.0 GB）；云端卡大就删掉这行或改 65536
+# GPU 需求写在基础文件 docker/compose.yaml 的 deploy.resources 里（nvidia 运行时），
+# 覆盖层不再出现 /dev/dxg、/usr/lib/wsl、LD_LIBRARY_PATH 这类手工通路。
 name: dshinfer
 
 services:
   infer:
-    # 基础文件里的 nvidia 设备预留在这里没有意义，直接清掉（Compose >= 2.24 的 !reset）
-    deploy: !reset null
-
-    devices:
-      - /dev/dxg:/dev/dxg
-
     volumes:
-      # 挂整个 /usr/lib/wsl，不要只挂 lib/：只挂 lib/ 时 nvidia-smi 会报
-      # "NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver"，
-      # NVML/libcuda 还需要 /usr/lib/wsl/drivers（Store 驱动副本）。实测全挂才通。
-      - /usr/lib/wsl:/usr/lib/wsl:ro
-      # 权重放 WSL 的 ext4（/mnt/d 是 9p，mmap 慢 5–10 倍）
       - ${MODELS_DIR:-/home/linc/models}:/models:ro
 
     environment:
-      LD_LIBRARY_PATH: /usr/lib/wsl/lib:/opt/llama/bin:/opt/llama/lib
-      # 8 GB 显存上的最优解（docs/docker.md 11.2 实测）：32K 上下文 = 40.4 t/s、显存 6.0 GB；
-      # 拉到 64K 后生成速度掉到 26.3 t/s。要长上下文就直接改这里或
-      # DSHINFER_N_CTX=65536 docker compose ... up -d
       DSHINFER_N_CTX: "32768"

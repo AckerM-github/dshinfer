@@ -43,7 +43,7 @@ docker/Dockerfile            单容器镜像：ubuntu:24.04 + python3.12 + b1220
 docker/requirements.lock     依赖锁：uv.lock 导出、44 个包全带 sha256，镜像按它 + --require-hashes 安装
 docker/compose.yaml          GPU 预留 + 权重只读卷 + env 与 .env 逐条对齐 + healthcheck
 docker/chat_template.jinja   从 D:\llm\runtime\chat_template.jinja 复制的 8908 B 模板
-docker/compose.wsl.yaml      WSL2 覆盖层：/dev/dxg 直通、ext4 权重路径、32K 上下文默认值
+docker/compose.wsl.yaml      WSL2 主机配置：ext4 权重路径 + 32K 上下文默认值（GPU 走 nvidia 运行时，与云一致）
 docker/ops.sh                运维入口：up / down / status / check / logs / bench / models / shell
 .dockerignore                构建上下文排除（上下文是仓库根）
 docs/docker.md               本文
@@ -86,7 +86,7 @@ docker compose -f docker/compose.yaml logs -f
 # 4) 冒烟
 curl http://127.0.0.1:8000/healthz
 curl http://127.0.0.1:8000/v1/models
-docker exec dshinfer /usr/lib/wsl/lib/nvidia-smi   # 看显存（镜像里没有 nvidia-smi 进 PATH）
+docker exec dshinfer nvidia-smi   # 看显存（由 nvidia 运行时注入）
 ```
 
 **没有 Docker 也想先验证"引擎进容器"这条路**：直接跑官方镜像，你的服务留在宿主机
@@ -181,7 +181,7 @@ services:
 - [ ] `docker run --rm --gpus all ubuntu:24.04 nvidia-smi` 能看到 4060 Laptop
 - [ ] `/healthz` 返回 `{"status":"ok",...}`，且 `engine` 字段到最后是 ready（不是 loading）
 - [ ] `/v1/chat/completions` 流式能出字，首 token 时间与裸机同量级（差 <100 ms）
-- [ ] `docker exec dshinfer /usr/lib/wsl/lib/nvidia-smi` 显存 ≈ 6.7 GB（64K）或 ≈ 6.0 GB（32K）
+- [ ] `docker exec dshinfer nvidia-smi` 显存 ≈ 6.8 GB（64K）或 ≈ 6.0 GB（32K）
 - [ ] 对照压测：改 `scripts/bench_load.py` 的 `SERVICE`/`ENGINE` 常量指向容器端口，
       与 `docs/perf.md` 的 1/2/4/8 并发档位逐项比（现成命令：`docker exec -i dshinfer /opt/venv/bin/python - < scripts/bench_load.py`）
 - [ ] `docker compose down` 后宿主机 `nvidia-smi` 不残留 llama-server
@@ -207,7 +207,7 @@ services:
 | 用户 | `linc`，**免密 sudo** | 装 docker 一条 apt 就够 |
 | 磁盘 | `/dev/sdd` 1007 GB，已用 3.9 GB，**剩 952 GB**（ext4） | 权重和镜像放这里 |
 | 内存 | **7.5 GiB + 2 GiB swap**（宿主机 15.5 GiB 的一半） | 5.24 GB 模型塞得下，但偏紧，建议调 `.wslconfig` |
-| GPU 直通 | `/dev/dxg` 存在；`/usr/lib/wsl/lib/libcuda.so.1` 存在；`nvidia-smi` 看到 RTX 4060 Laptop 8188 MiB / driver 610.60 / 当前占用 0 MiB | **最难的一步已经通了** |
+| GPU 直通 | 2026-11-10 起用 `nvidia-container-toolkit 1.20.2`（NVIDIA 源按架构分目录，26.04 可装）：`--gpus all` 可用，容器内 `nvidia-smi` 看到 RTX 4060 Laptop 8188 MiB / driver 610.60 | **与云端同一套，不再是 WSL 专有鬼路** |
 | docker | 未安装（无 docker / dockerd，也没有 Docker Desktop） | 但 `docker.io 29.1.3` + `docker-compose-v2 2.40.3` 就在已配好的阿里云源里 |
 | 出网 | WSL 内直连 archive.ubuntu.com 200、github.com 200（~0.8 s） | 不用代理也能下 release；Windows 侧 127.0.0.1:7890 的 Clash 在 NAT 模式下**不会**被 WSL 继承（就是启动时那条 warning） |
 
@@ -223,32 +223,71 @@ docker run --rm hello-world
 sudo usermod -aG docker $USER   # 之后重开 shell 可免 sudo（不必须）
 ```
 
-### 10.3 GPU 进容器：用 /dev/dxg 直通，不用 --gpus all
+### 10.3 GPU 进容器：装 nvidia-container-toolkit（与云完全同一套）
 
-26.04 源里没有 `nvidia-container-toolkit`（`apt-cache search nvidia-container` 为空，NVIDIA 源只挂到 24.04 noble），
-所以标准 `--gpus all` 开箱不可用。WSL2 的 GPU 通路本来就是 `/dev/dxg` + 宿主 `/usr/lib/wsl`，
-手工塞进容器效果等同（**必须挂整个 `/usr/lib/wsl`**：只挂 `lib/` 时 `nvidia-smi` 报
-`couldn't communicate with the NVIDIA driver`，因为 NVML 还要读 `/usr/lib/wsl/drivers` 里的 Store 驱动副本）：
+**2026-11-10 起本机改用标准 NVIDIA Container Toolkit**。此前「26.04 装不了」的判断是错的：
+NVIDIA 的 apt 仓库按 CPU 架构分目录（`stable/deb/amd64`），与发行版 codename 无关，Ubuntu 26.04 直接能装。
+装完之后 `--gpus all` 在 WSL2 可用，容器里只需要注入宿主的 `libcuda.so.1`（引擎镜像自带 cudart / cublas，见下），
+于是**本机 docker 与云端 Linux 的 GPU 通路一模一样**，`docker/compose.wsl.yaml` 里不再有任何 GPU 相关配置。
 
 ```bash
-docker run --rm \
-  --device /dev/dxg \
-  -v /usr/lib/wsl:/usr/lib/wsl:ro \
-  -e LD_LIBRARY_PATH=/usr/lib/wsl/lib \
-  nvidia/cuda:12.8.0-base-ubuntu24.04 /usr/lib/wsl/lib/nvidia-smi -L
-# 实测输出：GPU 0: NVIDIA GeForce RTX 4060 Laptop GPU (UUID: GPU-95e260be-...)
+# 1) 加 NVIDIA 源（key + list，改写成 signed-by 形式）
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+  | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+  | sed "s|^deb https://|deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://|" \
+  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
+sudo apt-get update
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-container-toolkit   # 实测 1.20.2-1
+
+# 2) 注册 nvidia 运行时并重启 docker
+sudo nvidia-ctk runtime configure --runtime=docker    # 写 /etc/docker/daemon.json 的 runtimes.nvidia
+sudo systemctl restart docker
+docker info | grep -A1 Runtimes   # → io.containerd.runc.v2  nvidia  runc
+
+# 3) 验证：不再需要 --device /dev/dxg 或 -v /usr/lib/wsl
+docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi
 ```
 
-本仓库已经备好覆盖层 [docker/compose.wsl.yaml](compose.wsl.yaml)（清掉 nvidia 设备预留、加 /dev/dxg 与 wsl libs、权重指向 ext4）：
+实测（2026-11-10，WSL 3.0.3 / Ubuntu 26.04.1 / docker 29.1.3）：
+
+```
+NVIDIA-SMI 610.47.03     KMD Version: 610.60     CUDA UMD Version: 13.3
+|  0  NVIDIA GeForce RTX 4060 ...  |  N/A  53C  P0  18W / 110W | 5999MiB / 8188MiB |
+容器内：/usr/lib/x86_64-linux-gnu/libcuda.so.1（187,984 B）、/dev/dxg；
+        /usr/lib/wsl 并没有挂进容器（ls: cannot access）
+```
+
+为什么这样就够——依赖关系的实测：
+
+```
+# docker exec dshinfer ldd /opt/llama/bin/libggml-cuda.so
+libcublas.so.12   => /opt/llama/lib/libcublas.so.12     # 镜像自带（引擎包里的）
+libcublasLt.so.12 => /opt/llama/lib/libcublasLt.so.12   # 镜像自带
+libcudart.so.12   => /opt/llama/lib/libcudart.so.12     # 镜像自带（Dockerfile 的 cudart 阶段）
+libcuda.so.1      => /usr/lib/x86_64-linux-gnu/...      # 宿主/toolkit 注入的唯一一个
+```
+
+即：**CUDA 用户态库在镜像里，驱动在宿主，toolkit 只负责把驱动和 /dev/dxg 递进来**。
+libnvidia-container 1.20.2 自带 WSL2 适配（WSL 的 `libcuda.so.1` 就是 `/usr/lib/wsl/lib` 里那份），
+所以也不需要 `--device /dev/dxg`。**Dockerfile 一行都不用改**。
+
+> 早期「手工 /dev/dxg + 挂整个 /usr/lib/wsl」的做法（2026-11-09 版本文档）在没装 toolkit 的机器上仍可用，
+> 历史见 `git log -p -- docker/compose.wsl.yaml`；本仓库默认路径已不再使用它。
+
+装了 toolkit 之后 [docker/compose.wsl.yaml](compose.wsl.yaml) 只剩两条有效配置：
+
+```yaml
+volumes:
+  - ${MODELS_DIR:-/home/linc/models}:/models:ro   # WSL 用 ext4 权重；云上换 /srv/models
+environment:
+  DSHINFER_N_CTX: "32768"                          # 8 GB 显存的上下文默认值
+```
 
 ```bash
-cp -r /mnt/d/llm/infer ~/infer && cd ~/infer
-docker compose -f docker/compose.yaml -f docker/compose.wsl.yaml build
+cd ~/infer
 docker compose -f docker/compose.yaml -f docker/compose.wsl.yaml up -d
 ```
-
-> `deploy: !reset null` 需要 Compose >= 2.24（26.04 源里是 2.40.3）。若你的版本不支持，
-> 就把 `docker/compose.yaml` 里的 `deploy:` 整段注释掉再叠这个文件。
 
 ### 10.4 权重必须放 ext4，不要挂 /mnt/d
 
@@ -280,7 +319,7 @@ Windows 桌面/浏览器随时能把它吃掉一部分（实测这一分钟是 0
 ### 10.6 建议按这个顺序动手
 
 1. `sudo apt install -y docker.io docker-compose-v2` → `docker run --rm hello-world`
-2. 验证 GPU 直通：上面那条 `nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi`，要看到 4060 Laptop
+2. 装 `nvidia-container-toolkit`（§10.3 三条命令）→ `docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi` 要看到 4060 Laptop
 3. 拷权重到 `/home/linc/models`、拷仓库到 `~/infer`
 4. `docker compose -f docker/compose.yaml -f docker/compose.wsl.yaml build`（首次下 188 MB + 594 MB）
 5. **先用 `DSHINFER_N_CTX=32768` 跑通**，再试 65536
@@ -315,7 +354,7 @@ docker.io 29.1.3、容器内 llama.cpp build 12202 (CUDA 12.8)、RTX 4060 Laptop
 | pp512 | 2,077–2,337 t/s | 2,399 | −3% ～ −13% |
 | tg128 | 41.3–42.5 t/s | 43.45 | −2% ～ −5% |
 
-注意：**同一份二进制在容器里就能跑到 41+ t/s**，所以 WSL + 容器 + /dev/dxg 这条通路本身没有显著损失。
+注意：**同一份二进制在容器里就能跑到 41+ t/s**，所以「容器 + nvidia 运行时」这条通路本身没有显著损失（WSL 与云一致）。
 
 但把 `llama-server` 按生产参数起起来，单流生成速度是这样的（同一镜像、同一权重、`-np 4 --kv-unified -ctk/-ctv q8_0 -fa on`）：
 
@@ -418,7 +457,7 @@ bash docker/ops.sh <命令> [参数]
 `bench` 默认参数 `-p 512 -n 128 -ngl 99 -fa 1`，想跑别的直接跟参数，例如
 `bash docker/ops.sh bench -p 2048 -n 128 -ngl 99 -fa 1 -ctk q8_0 -ctv q8_0`。
 它跑一次性容器而不是 `docker exec`，因为服务进程占着 6 GB 显存，不先停会 OOM；
-WSL 下必须带 `-v /usr/lib/wsl:/usr/lib/wsl:ro --device /dev/dxg`（脚本已内置）。
+需要 GPU 时统一 `--gpus all`（WSL 与云同一行，脚本已内置）；早期手工 `/dev/dxg` 直通已退役。
 
 实测（2026-11-09，WSL2 Ubuntu 26.04 + docker 29.1.3，32K 上下文配置）：
 
@@ -629,4 +668,21 @@ docker exec dshinfer sh -lc 'cd /app && timeout 8 script -qec   "/opt/venv/bin/p
 
 > 顺带修正本文档旧结论：§11.2 的「64K 掉 35%」、§11.5 的「切 64K 要付 −35% 速度」都是 `--fit` 的副作用，不是上下文本身的代价。
 > 深度本身的代价见 `docs/perf.md` §14：64K 填满时约 −22%（线性，来自 KV 字节带宽）。
+
+### 16.4 WSL 也改用 nvidia-container-toolkit：与云完全同构（2026-11-10）
+
+原先的判断是「Ubuntu 26.04 源里没有 toolkit（NVIDIA 官方源只到 24.04 noble）」。**该结论已被推翻**：
+NVIDIA 的 apt 仓库按架构分目录（`stable/deb/amd64`），与发行版 codename 无关，26.04 resolute 直接装成功。
+
+| 项 | 结果 |
+|---|---|
+| 安装 | `nvidia-container-toolkit 1.20.2-1`（toolkit-base / libnvidia-container1 / libnvidia-container-tools），顺带启用 `nvidia-cdi-refresh.path` 与 `.service` |
+| 运行时 | `nvidia-ctk runtime configure --runtime=docker` 写入 `/etc/docker/daemon.json` 的 runtimes.nvidia（path 指向 nvidia-container-runtime）；重启后 `docker info` → `Runtimes: io.containerd.runc.v2 nvidia runc` |
+| `--gpus all` | ✅ `docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi` → 610.47.03 / KMD 610.60 / RTX 4060 / 5999 MiB |
+| 注入内容 | 容器内多出 `/usr/lib/x86_64-linux-gnu/libcuda.so.1`（187,984 B）与 `/dev/dxg`；**没有挂 `/usr/lib/wsl`** |
+| 依赖真相 | `ldd /opt/llama/bin/libggml-cuda.so`：`libcublas.so.12` / `libcublasLt.so.12` / `libcudart.so.12` 全部解析到镜像内 `/opt/llama/lib/`，只有 `libcuda.so.1` 来自宿主 → toolkit 只补驱动这一块，**Dockerfile 一行没改** |
+| 配置收敛 | `docker/compose.wsl.yaml` 删掉 `devices` / `/usr/lib/wsl` 挂载 / `LD_LIBRARY_PATH` / `deploy: !reset`，只剩「权重目录 + 32K 默认值」；`ops.sh bench` 统一 `--gpus all` |
+
+去掉所有手工挂载后的实测：`ops.sh up` **12 s** 就绪、32K 显存 **6,001 MiB**、`ops.sh check` **7/7 通过**；
+64K（只用基础 compose，不带覆盖层）短 prompt **34–35 t/s**、显存 **6,737 MiB**、容器内 `nvidia-smi` 可用（运行时注入）。
 
