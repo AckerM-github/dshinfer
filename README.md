@@ -268,7 +268,10 @@ uv run python scripts/bench_load.py   # 四档并发 × 服务/原生两个端�
 ```
 D:\llm\infer
 ├─ pyproject.toml
-├─ .env                引擎/上下文/批参数（重启后仍然生效）
+├─ config\
+│  ├─ base.env         调优唯一来源（上下文 / KV / 并发 / 批大小…，两形态共用）
+│  └─ docker.env       容器专属路径（/models、/opt/llama、/var/log/dshinfer）
+├─ .env                本机路径覆盖（不提交；调优默认值见 config/base.env）
 ├─ src\dshinfer\
 │  ├─ api.py          路由 / SSE / 错误映射
 │  ├─ service.py      准入、渲染、超时、取消、埋点
@@ -301,27 +304,46 @@ D:\llm\infer
 │  ├─ trace_one.py          发一条请求并画出时间线瀑布图
 │  ├─ probe_tools.py        模型侧工具格式探针
 │  ├─ agent_demo.py         最小 agent 循环（工具执行 + 回灌）
-│  ├─ supervise.ps1         看护进程（手动拉起，不做开机自启）
-│  ├─ start.ps1             拉起看护 + 等待健康
-│  └─ stop.ps1              优雅停止 + 兜底清理
+│  ├─ ops.ps1               统一入口 up/down/status/check/logs/bench/tui/verify（与 ops.sh 同名）
+│  ├─ verify_env.py         两形态配置一致性比对（17 个契约键）
+│  ├─ supervise.ps1         看护进程（由 ops.ps1 up 调用，不做开机自启）
+│  ├─ start.ps1             拉起看护 + 等待健康（内部实现）
+│  └─ stop.ps1              优雅停止 + 兜底清理（内部实现）
 ├─ eval\
 │  ├─ cases.jsonl        26 个用例 / 14 类
 │  ├─ judge.py           规则判定 + 代码真执行
 │  └─ run_eval.py        跑批 + 分类汇总 + 存档
+├─ docker\
+│  ├─ Dockerfile        三阶段：engine（llama.cpp）/ wheel / runtime
+│  ├─ compose.yaml      基础编排（GPU 预留 + 权重只读卷 + env_file）
+│  ├─ compose.wsl.yaml  WSL 覆盖层（ext4 权重 + 32K 上下文）
+│  ├─ ops.sh            容器侧统一入口（与 ops.ps1 同名子命令）
+│  └─ requirements.lock 带哈希的固定依赖（pip --require-hashes）
 ├─ docs\
+│  ├─ perf.md            性能工程报告（roofline / 批处理 / 投机 / 量化 / --fit）
+│  ├─ deploy.md          两形态部署契约：配置单源、ops 对照、verify、上云
+│  ├─ docker.md          容器化全流程（WSL2 + toolkit + 构建验证记录）
+│  ├─ tui.md             终端面板：向导 / 7 视图 / 数据来源
 │  ├─ bench.md           服务层压测报告
-│  ├─ perf.md            性能工程报告（roofline / 批处理 / 投机 / 量化 / 架构限制）
 │  ├─ eval.md            评测集、判定策略、基线
-│  ├─ ops.md             常驻与启动
+│  ├─ ops.md             常驻与启动（ops.ps1 / ops.sh）
 │  ├─ trace.md           单请求 trace
-│  ├─ models.md          模型管理
+│  ├─ models.md          模型管理与权重清单
+│  ├─ scope.md           五层分工与欠账
+│  ├─ inventory.md       文件清单
 │  └─ dsh.md             接入 DSH
 └─ tests\
-   ├─ test_api.py
-   ├─ test_scheduler.py
-   ├─ test_registry.py
-   ├─ test_render.py
-   ├─ test_judge.py
-   ├─ test_trace.py
-   └─ test_toolcall.py
+   ├─ test_api.py            接口 / SSE / 错误映射
+   ├─ test_scheduler.py      调度与配额
+   ├─ test_registry.py       模型注册与热发现
+   ├─ test_gguf.py           GGUF 头解析
+   ├─ test_render.py         模板渲染
+   ├─ test_judge.py          评测判定
+   ├─ test_trace.py          trace 环形缓冲
+   ├─ test_toolcall.py       工具调用解析
+   ├─ test_reasoning.py      思考模式
+   ├─ test_isolation.py      两形态隔离守卫（配置单源 / 无宿主路径）
+   ├─ test_tui_monitor.py    面板纯函数（相位 / 速率 / sparkline）
+   ├─ test_tui_probe.py      采集层降级路径
+   └─ test_tui_live.py       快照渲染
 ```

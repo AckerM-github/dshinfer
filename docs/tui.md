@@ -67,7 +67,7 @@ bash docker/ops.sh tui
 # 打一次完整 JSON 快照（数据层通不通一看就知道；有 errors 时 exit 1）
 uv run --extra tui python -m dshinfer.tui --snapshot
 
-# 打印这份预设对应的 compose environment: 片段
+# 打印这份预设对应的配置片段（env_file 形式，含容器内路径）
 uv run --extra tui python -m dshinfer.tui --dump-env
 
 # 上面那条去掉容器路径（导出本机 D:\\ 路径版本）
@@ -101,7 +101,7 @@ uv run --extra tui python -m dshinfer.tui --preset ~/.config/dshinfer/presets/32
 # Windows: %APPDATA%\\dshinfer\\presets\\       （可用 DSHINFER_PRESETS_DIR 覆盖）
 # Linux/WSL: ~/.config/dshinfer/presets/
 <name>.json     预设本体（字段与 Settings 一一对应）
-<name>.env      可直接贴进 docker/compose.yaml 的 environment: 片段（键名与 compose 完全一致）
+<name>.env      可直接当 env_file 用，或整段贴进本机 .env（键名与 Settings 字段一致）
 ```
 
 第 10 屏会把 `problems()`（跑不起来的问题，红字）与 `warnings()`（能跑但有代价的，
@@ -138,7 +138,7 @@ uv run --extra tui python -m dshinfer.tui --preset ~/.config/dshinfer/presets/32
 
 NVML 是 **Windows 和 Linux 都支持的同一套 API**，所以"双平台"不是两套代码：
 `probe.py` 按顺序 dlopen 候选库（`nvml.dll` → `System32`；
-`/usr/lib/wsl/lib/libnvidia-ml.so.1` → `/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1` → 裸名），
+`/usr/lib/wsl/lib/libnvidia-ml.so.1`（WSL 宿主）→ `/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1`（容器里由 nvidia 运行时注入，不再靠挂 /usr/lib/wsl）→ 裸名），
 第一个成功的决定 `backend` 字符串，实际路径可由 `probe.nvml_library_path()` 查到。
 **不调用 `nvidia-smi`**：容器里根本没有那个二进制，而且解析命令行输出更脆。
 

@@ -41,7 +41,7 @@
 ```
 docker/Dockerfile            单容器镜像：ubuntu:24.04 + python3.12 + b12202 的 Linux CUDA 12.8 引擎（三阶段）
 docker/requirements.lock     依赖锁：uv.lock 导出、44 个包全带 sha256，镜像按它 + --require-hashes 安装
-docker/compose.yaml          GPU 预留 + 权重只读卷 + env 与 .env 逐条对齐 + healthcheck
+docker/compose.yaml          GPU 预留 + 权重只读卷 + env_file 读 config/*.env + healthcheck
 docker/chat_template.jinja   从 D:\llm\runtime\chat_template.jinja 复制的 8908 B 模板
 docker/compose.wsl.yaml      WSL2 主机配置：ext4 权重路径 + 32K 上下文默认值（GPU 走 nvidia 运行时，与云一致）
 docker/ops.sh                运维入口：up / down / status / check / logs / bench / models / shell
@@ -66,31 +66,37 @@ scripts/wsl-deploy.sh        git 单源部署：clone/pull → ops.sh up --build
 
 ## 4. 跑起来的步骤（含前置检查）
 
-```powershell
-# 0) 前置：本机现在没有 docker（docker 命令 CommandNotFoundException），先装 Docker Desktop
-#    并确保 Settings → Resources → WSL Integration 勾上你的 Ubuntu 发行版
-wsl -l -v                     # 已有 Ubuntu / kali-linux，均 Stopped，Docker Desktop 会自己起 WSL
+本机已经跑通（WSL2 里自建 dockerd + nvidia-container-toolkit 1.20.2），最短路径如下；
+纯 Linux 云主机把 `docker/compose.wsl.yaml` 去掉即可，三形态的完整对照见 [docs/deploy.md](deploy.md)。
 
-# 1) 验证 GPU 在容器里可见（失败就是 nvidia-container-toolkit / 驱动层没通）
-docker run --rm --gpus all ubuntu:24.04 nvidia-smi
+```bash
+# 0) 前置（一次性）：docker 与 GPU 通路
+#    Windows 侧是 WSL2 里自建 dockerd（不装 Docker Desktop，见 §10.2），再装 toolkit（§10.3）
+docker run --rm --gpus all ubuntu:24.04 nvidia-smi    # 看得到卡 = 通路 OK
 
-# 2) 先停掉 Windows 侧正在跑的引擎，避免抢 8124 端口 / 占显存
-D:\llm\infer\scripts\stop.ps1
+# 1) 一条命令：构建 + 后台启动 + 轮询 /healthz（自动叠加 compose.wsl.yaml）
+bash docker/ops.sh up --build
 
-# 3) 构建 + 启动
-cd D:\llm\infer
-docker compose -f docker/compose.yaml build
-docker compose -f docker/compose.yaml up -d
-docker compose -f docker/compose.yaml logs -f
-
-# 4) 冒烟
+# 2) 体检 + 冒烟
+bash docker/ops.sh check                     # 7 项：容器 / 引擎 / 权重 sha256 / 显存 / 磁盘
 curl http://127.0.0.1:8000/healthz
-curl http://127.0.0.1:8000/v1/models
-docker exec dshinfer nvidia-smi   # 看显存（由 nvidia 运行时注入）
+curl http://127.0.0.1:8000/admin/config      # 18 键契约：容器里实际生效的配置
+
+# 3) 停
+bash docker/ops.sh down
 ```
 
-**没有 Docker 也想先验证"引擎进容器"这条路**：直接跑官方镜像，你的服务留在宿主机
-（把 `.env` 里的 `DSHINFER_ENGINE` 用不上，因为服务层会自己 spawn —— 所以这条路只适合手动比对，
+**Windows 原生形态**用同名的 PowerShell 入口：`powershell -ExecutionPolicy Bypass -File .\scripts\ops.ps1 up`，
+子命令与 `ops.sh` 一一对应（`up` / `down` / `status` / `check` / `verify` …），对照表见 [docs/deploy.md](deploy.md) §3。
+两种形态共用同一张卡：容器起来前先 `powershell -ExecutionPolicy Bypass -File .\scripts\ops.ps1 stop`，
+否则显存不够，引擎加载直接 CUDA OOM。
+
+配置只有一个来源：调优值在 `config/base.env`、容器路径在 `config/docker.env`，
+`compose.yaml` 用 `env_file` 读、镜像里也带同一份副本，宿主 `.env` 只放本机路径（模板 `.env.example`）。
+**不要再往 `compose.yaml` 里加 `environment`** —— 那 21 行已经删掉了。
+
+**只想先验证「引擎进容器」这条路**：直接跑官方镜像，服务层留在宿主机
+（这条路不经过我们的服务层，`DSHINFER_ENGINE` 不参与，服务层会自己 spawn 引擎，所以只适合手动比对，
 不能直接复用 `LlamaServerEngine`）：
 
 ```powershell
@@ -113,7 +119,7 @@ docker run --rm --gpus all -p 127.0.0.1:8124:8124 \
 | 4 | 镜像里缺 cudart | `error while loading shared libraries: libcudart.so.12` | Dockerfile 已把 cudart 包收进 `/opt/llama/lib` 并设 `LD_LIBRARY_PATH` |
 | 5 | 驱动/cudart 版本 | `CUDA driver version is insufficient` | 驱动 610.60 足够新（支持 CUDA 12.8/13.x），真报错就换 `LLAMA_CUDA=13.5` 的资产 |
 | 6 | `docker build` 拉 GitHub release 慢/超时 | 卡在 curl | 加 `--build-arg RELEASE_BASE=<镜像或内网地址>`；或预下载两个 tar.gz 用 `COPY` |
-| 7 | 忘了 `scripts/stop.ps1` | 宿主机引擎还在，显存/端口冲突 | 先停宿主，再 up；容器 `engine_port` 是容器内 8124，不是映射端口 |
+| 7 | 忘了停 Windows 侧原生服务 | 宿主机引擎还在，显存/端口冲突 | 先 `scripts\ops.ps1 stop`，再 up；容器 `engine_port` 是容器内 8124，不是映射端口 |
 | 8 | 孤儿 llama-server | `docker stop` 后 `nvidia-smi` 还占显存 | 已用 tini + `stop_grace_period: 30s`；异常时 `docker kill` + `docker compose down` |
 | 9 | 配置曾有两份（compose 手抄 .env） | 容器里的调优值和宿主悄悄不一致 | 已收敛成单源：调优值只在 `config/base.env`，容器路径在 `config/docker.env`，两边都通过 `env_file` / 镜像内副本读同一份；`bash docker/ops.sh verify` 逐键比对，见 `docs/deploy.md` |
 
@@ -443,6 +449,11 @@ bash docker/ops.sh <命令> [参数]
 `OPS_COMPOSE_FILES`（自定义 compose 文件串）、`MODELS_DIR`（默认取容器 `/models` 的
 实际挂载源，取不到才退回 `~/models`）、`BENCH_MODEL`（默认 Q4_K_M 的容器内路径）。
 
+这批子命令与 Windows 的 `scripts/ops.ps1` 同名同义（`up` / `down` / `stop` / `start` / `restart` / `status` /
+`check` / `logs` / `bench` / `models` / `tui` / `verify` / `fetch`），两形态的对照与隔离约束见
+[docs/deploy.md](deploy.md) §3。调优参数不再从这里传：容器读 `config/base.env` + `config/docker.env`
+（`env_file`，镜像里也带同一份副本），宿主 `.env` 只管本机路径。
+
 | 命令 | 作用 |
 | --- | --- |
 | `up [--build]` | 构建（可选）+ 后台启动 + 轮询 `/healthz`（最多 300 s），就绪后打印容器状态 |
@@ -452,6 +463,8 @@ bash docker/ops.sh <命令> [参数]
 | `logs [N] [-e] [-f]` | 默认服务日志；`-e` 读容器内 `/var/log/dshinfer/llama-server.log`；`-f` 跟随 |
 | `bench [args] [--stay-down]` | 停服务释放显存 → 一次性容器跑 `llama-bench` → 自动拉起服务（`--stay-down` 则停着） |
 | `models` | 打印 `models/models.json` 清单 + 校验 `$MODELS_DIR` 里的文件 |
+| `verify` | 两形态配置一致性：容器内 `/admin/config` ↔ 宿主采集同一 JSON，17 个契约键逐键比对（见 [docs/deploy.md](deploy.md) §4） |
+| `tui` | 在容器里跑终端面板（NVML 由 nvidia 运行时注入，不再挂 `/usr/lib/wsl`） |
 | `shell` | `docker exec -it dshinfer bash` |
 
 `bench` 默认参数 `-p 512 -n 128 -ngl 99 -fa 1`，想跑别的直接跟参数，例如
@@ -526,16 +539,16 @@ bash scripts/wsl-deploy.sh --source git@github.com:AckerM-github/dshinfer.git --
 | `--fresh` | 备份现有目录后重新 clone（首次迁移 / 换来源用） |
 | `--no-build` | 跳过镜像构建，只重启容器 |
 | `--no-up` | 只同步代码 |
-| `--source PATH` | 首次 clone 的来源，默认 `/mnt/d/llm/infer`（也可以是 GitHub 地址） |
+| `--source URL` | 首次 clone 的来源，默认 `https://github.com/AckerM-github/dshinfer.git`（也可传本地路径） |
 | `--branch NAME` | 分支，默认 `main` |
 | `--dir PATH` | 目标目录，默认 `$HOME/infer` |
 
 ### 13.3 要点与坑
 
-1. **来源默认是本地路径** `/mnt/d/llm/infer`：零网络、秒级 clone，适合当前这台机器。
-   想改成直接从 GitHub 拉，`--source git@github.com:AckerM-github/dshinfer.git --fresh`；
-   但 WSL 里 GitHub 的 22 端口现在被挡（`Connection closed by 198.18.0.25 port 22`），HTTPS 每次要凭证，
-   所以先走本地路径，Windows 侧再 push 到 GitHub 备份。
+1. **来源默认是 GitHub 的 HTTPS 地址** `https://github.com/AckerM-github/dshinfer.git`：仓库 public，匿名可 clone，
+   克隆出来的 `origin` 就是 HTTPS，之后 `git pull` 不再依赖 Windows 的 D 盘（这是「两种形态互不依赖」的一部分）。
+   WSL 里没有 `~/.ssh`、GitHub 的 22 端口也被挡（`Connection closed by 198.18.0.41 port 22`），所以走 HTTPS；
+   断网时传 `--source /mnt/d/llm/infer` 仍可用（只是又变成依赖宿主）。
 2. **`git pull --ff-only`**：本地有改动就直接失败，不会静默 merge。脚本同步后会列出未提交改动
    —— 这些文件会被打进镜像，等于「部署了一个不在 git 里的版本」，看到警告先处理。
 3. **WSL 里 docker 要 sudo**：脚本自己探测（`sudo -n docker info`）并给 docker 调用加前缀。
