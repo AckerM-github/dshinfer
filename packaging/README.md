@@ -1,28 +1,40 @@
-# packaging/ —— 自建 `dshinfer-engine` wheel
+# packaging/ —— 自建 `dshinfer-engine` wheel（Windows 本地构建）
 
-把 `vendor/llama_cpp`（Python 绑定）+ 配套原生库打成两个平台 wheel。
-**不编译、不依赖 pip 上游包**，产物由 `docker/Dockerfile` 直接 `COPY` 进镜像。
+本项目是学习项目，**不对外发布**：在 Windows 上本地构建、本地安装就是完整流程。
+容器只是复用同一个脚本打出来的 Linux wheel，不走任何远端源。
 
 ```text
 packaging/
-  engine/           wheel 的元数据与说明（pyproject.toml / README / NOTICE / 三份许可）
-  native/<平台>/    stage_native.py 摊出来的原生库（不进 git）
-  dist/             产物（不进 git）
-  index/simple/     PEP 503 静态索引页（进 git）
-  stage_native.py   vendor 之外的第二件事：把原生库摊平到 native/<平台>/
-  build_engine_wheel.py  手写 zip wheel（没有构建后端）
-  build_index.py   生成索引页
+  engine/                 wheel 元数据与说明（pyproject.toml / README / NOTICE / 三份许可）
+  native/<平台>/          stage_native.py 摊出来的原生库（不进 git）
+  dist/                   产物（不进 git）
+  stage_native.py         把原生库摊平到 native/<平台>/
+  build_engine_wheel.py   手写 zip wheel（没有构建后端）
 ```
 
-## 构建
+## 构建：Windows（主路径）
 
 ```powershell
 python packaging\stage_native.py --platform win_amd64 --from-dir D:\llm\runtime\llama-inproc\bin
-python packaging\stage_native.py --platform manylinux_2_35_x86_64 --from-wheel D:\dshworkspace\_wheel\up036-cu124.whl
 python packaging\build_engine_wheel.py --platform win_amd64
-python packaging\build_engine_wheel.py --platform manylinux_2_35_x86_64
-python packaging\build_index.py
+uv pip install --no-deps --force-reinstall `
+    packaging\dist\dshinfer_engine-0.3.36.post1-py3-none-win_amd64.whl
 ```
+
+装完自检：
+
+```powershell
+.\.venv\Scripts\python.exe -c "import llama_cpp, importlib.metadata as m; print(llama_cpp.__version__, m.version('dshinfer-engine'))"
+```
+
+## 构建：Linux（只在要重建容器镜像时用）
+
+```powershell
+python packaging\stage_native.py --platform manylinux_2_35_x86_64 --from-wheel D:\dshworkspace\_wheel\up036-cu124.whl
+python packaging\build_engine_wheel.py --platform manylinux_2_35_x86_64
+```
+
+`docker/Dockerfile` 会 `COPY packaging/dist/*manylinux*.whl` 进镜像。
 
 ## 本次产物（2026-11-12）
 
@@ -41,11 +53,5 @@ python packaging\build_index.py
 
 ## 分发
 
-PyPI 单文件上限 100 MB，两个 wheel 都超，所以走 GitHub Releases + 静态索引页：
-
-```bash
-gh release create engine-v0.3.36.post1 packaging/dist/*.whl --notes "dshinfer-engine 0.3.36.post1"
-pip install dshinfer-engine --extra-index-url https://ackerm-github.github.io/dshinfer/simple/
-```
-
-（`gh release` 尚未执行；本机只有 SSH key 与 GCM 凭据，需要用户确认后再发。）
+不做。wheel 留在 `packaging/dist/`，换机器就拷过去 `pip install`。
+不发 PyPI（单文件上限 100 MB，这两个都超）、不发 GitHub Releases。

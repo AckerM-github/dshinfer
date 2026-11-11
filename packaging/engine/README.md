@@ -104,15 +104,9 @@ python -c "import llama_cpp, pathlib; print(llama_cpp.__version__, pathlib.Path(
 
 ## 分发
 
-PyPI 单文件上限 100 MB，这两个 wheel 都超了，所以**不走 PyPI**，走 GitHub Releases +
-静态索引页（与 llama-cpp-python 的做法一致）：
-
-```bash
-gh release create engine-v0.3.36.post1 packaging/dist/*.whl --notes "dshinfer-engine 0.3.36.post1"
-pip install dshinfer-engine --extra-index-url https://ackerm-github.github.io/dshinfer/whl/
-```
-
-索引页由 `python packaging\build_index.py` 生成到 `packaging/index/`。
+不做。这是学习项目，wheel 只在本机构建、本机安装：产物留在 `packaging/dist/`，
+换机器就拷过去 `pip install`。不发 PyPI（单文件上限 100 MB，这两个都超），
+也不发 GitHub Releases。
 
 ## 边界（诚实说明）
 
