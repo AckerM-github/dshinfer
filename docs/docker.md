@@ -711,27 +711,44 @@ NVIDIA 的 apt 仓库按架构分目录（`stable/deb/amd64`），与发行版 c
 镜像里却还躺着一份 1.7 GB 的 llama.cpp 二进制与 `libggml-cuda.so`，等于养两套引擎、两套参数、
 两套日志。要么容器降回 `llamacpp`（就得把删掉的适配器留着），要么让容器也用进程内绑定。
 
-### 17.2 关键发现：官方发布 manylinux wheel
+### 17.2 引擎从哪儿来：自建 `dshinfer-engine` wheel
 
-llama-cpp-python 的 GitHub release 里，与 Windows 的 `py3-none-win_amd64.whl` 并列，
-还有一份 **Linux** 的：
+第一版是直接 `pip install` 上游的 manylinux wheel（1.78 GB）。它能跑，但有个说不通的地方：
+容器里真正的代码是**上游发布的** `llama_cpp`，我们仓库里的 `vendor/llama_cpp` 只是"同源副本"——
+改了 vendor，容器完全不知道（15 个 `.py` 逐字节相同，所以没出问题，但规矩被破坏了）。
+
+现在容器装的是**自己打的包**：
 
 ```text
-https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.36-cu124/
-    llama_cpp_python-0.3.36-py3-none-manylinux_2_35_x86_64.whl      # 1.78 GB
+Python 代码  ← vendor/llama_cpp/（15 个 .py，逐字节，仓库里的那份就是真相源）
+原生库      ← llama-cpp-python 0.3.36 cu124 wheel 里的 .so（静态后端，与绑定同源）
+产物        ← packaging/dist/dshinfer_engine-0.3.36.post1-py3-none-manylinux_2_35_x86_64.whl（0.86 GB）
 ```
 
-`py3-none` 意味着里面没有 Python C 扩展，只有 Python 代码 + **预编译好的 CUDA 版 `libllama.so`
-/ `libggml.so` / `libggml-base.so` / `libggml-cpu.so` / `libggml-cuda.so`**。
-所以容器里既不需要 `nvcc`，也不需要 CUDA Toolkit —— 这与 Windows 侧“装个 wheel 就能用 GPU”
-是同一件事，只是平台不同。
+打包脚本三件：`packaging/stage_native.py`（摊原生库）、`packaging/build_engine_wheel.py`（手写 zip）、
+`packaging/build_index.py`（PEP 503 索引页）。构建镜像前先跑前两个：
+
+```powershell
+python packaging\stage_native.py --platform manylinux_2_35_x86_64 `
+    --from-wheel D:\dshworkspace\_wheel\up036-cu124.whl
+python packaging\build_engine_wheel.py --platform manylinux_2_35_x86_64
+```
+
+**原生库为什么不用 llama.cpp 官方 tar.gz**：官方 Linux 包是 `GGML_BACKEND_DL=ON` 编的
+（20 个 `libggml-cpu-<arch>.so` 插件、`libllama.so.0.9.0`），与绑定 0.3.36 的 ctypes 声明对不上，
+容器里一 decode 就 `segfault at 100 ip 0000000000000100`；同一个镜像里 `llama-cli` 却正常。
+换成 wheel 里那份静态后端（`libllama.so.0.5.0` / `libggml-base.so.0.25.3`）立刻正常。
+细节与排查过程见 `packaging/engine/README.md`。
+
+两个平台的体积差约 2 倍：Windows 那份要自带 `cublas64_12.dll` + `cublasLt64_12.dll`（735 MB）
+和 `ggml-cuda.dll`（873 MB）；Linux 的 CUDA 运行时由基础镜像提供，我们只带 `libggml-cuda.so`（880 MB，一份）。
 
 | 项 | 原生（Windows） | 容器（Linux） |
 |---|---|---|
 | 引擎 | `inproc` | `inproc` |
-| 引擎二进制 | `D:\llm\runtime\llama-inproc\bin\*.dll`（10 个 / 1.59 GB） | wheel 自带的 `*.so`（同一版本 0.3.36 / cu124） |
-| 绑定代码 | `vendor/llama_cpp`（15 个 .py / 16,910 行） | 同一个 wheel 里的 `llama_cpp` 包 |
-| 谁提供 | `.env` 的 `DSHINFER_INPROC_LIB_DIR` | Dockerfile `ENV` |
+| 引擎二进制 | `D:\llm\runtime\llama-inproc\bin\*.dll`（10 个 / 1.59 GB），或 `dshinfer-engine` 的 `win_amd64` wheel | `dshinfer-engine` 的 manylinux wheel 自带 7 个 `*.so`（静态后端） |
+| 绑定代码 | `vendor/llama_cpp`（15 个 .py / 16,910 行） | wheel 里同一份 `.py`（打包时从 vendor 拷） |
+| 谁提供 | `.env` 的 `DSHINFER_INPROC_LIB_DIR` | wheel 自带的 `llama_cpp/lib/` |
 | 并发 | **1** | **1** |
 | CUDA 来自 | 系统驱动 610.60 + `llama-inproc\bin` 里的 cublas/cudart | `nvidia/cuda:12.8.0-runtime` 里的 `libcublas` / `libcudart` |
 
@@ -742,17 +759,21 @@ ARG UBUNTU_BASE=ubuntu:24.04
 ARG CUDA_BASE=nvidia/cuda:12.8.0-runtime-ubuntu24.04   # 注意：runtime 不是 devel
 
 FROM ${UBUNTU_BASE} AS wheel        # 只负责把 src/ 打成 wheel（hatchling 不进运行时）
-FROM ${CUDA_BASE}                  # 运行时：python3 + /opt/venv + manylinux wheel
+FROM ${CUDA_BASE}                  # 运行时：python3 + /opt/venv + 自建引擎 wheel
 ```
 
 三个要点：
 
 1. **两个 ARG 必须在第一个 `FROM` 之前**。写在阶段之间的话，后面的 `FROM ${CUDA_BASE}`
    拿到空值，报 `failed to solve: base name (${CUDA_BASE}) should not be blank`（本节第一次构建就踩了）。
-2. `pip install --no-deps <wheel-url>` —— 依赖不跟着走，由 `docker/requirements.lock` 按
-   `--require-hashes` 装（新增了 `numpy==2.5.4`、`diskcache==5.6.3`，这两个是 llama-cpp-python 的运行时依赖）。
-3. 构建期自检：`llama_cpp.__version__ == 0.3.36`，且包里 `lib/` 下必须有 `libllama.so*` 与
-   `*ggml-cuda*`。缺一个就 fail fast，不要等到运行时才发现“没有 GPU 后端”。
+2. `COPY packaging/dist/dshinfer_engine-*-manylinux*.whl /tmp/engine/` 后
+   `pip install --no-deps` —— 依赖不跟着走，由 `docker/requirements.lock` 按 `--require-hashes`
+   装（含 `numpy==2.5.4`、`diskcache==5.6.3` 这两个 llama-cpp-python 的运行时依赖）。
+   wheel 不入库（`packaging/dist/` 在 `.gitignore` 与 `.dockerignore` 里），所以**先打包再 build**；
+   `.dockerignore` 同时排除了 1.6 GB 的 Windows wheel，别让它进构建上下文。
+3. 构建期自检：`importlib.metadata.version("dshinfer-engine")`、`lib/` 下必须有 `libllama.so*`、
+   `*ggml-cuda*`、`libggml-cpu-*`。**不能 `import llama_cpp`**——它在模块级 dlopen，
+   构建期没有 `libcuda.so.1`（那是运行时由 nvidia runtime 注入的）。
 
 ### 17.4 和上一版的对照
 

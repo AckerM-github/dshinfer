@@ -53,7 +53,7 @@ _logger.py 50 / _ggml.py 12 / __init__.py 4
 
 | 目录 | 对应 llama.cpp | 谁用 |
 |---|---|---|
-| `runtime\llama.cpp\` | build 12202 / `d6be06557` | `llama-server.exe`（`LlamaServerEngine`） |
+| `runtime\llama.cpp\` | build 12202 / `d6be06557` | 只作历史遗留；`llamacpp` 引擎已于 2026-11-11 删除 |
 | `runtime\llama-inproc\bin\` | `7d7f0287`（2026-11-08） | `vendor/llama_cpp`（`InprocEngine`） |
 
 ## 怎么用
@@ -77,7 +77,18 @@ set DSHINFER_ENGINE=inproc
 
 ### 我们的改动
 
-（暂无。当前是原样移植，用来先跑通链路。）
+#### 1) 按 SONAME 加载 ggml 后端（`llama_cpp.py`，紧跟 `_lib = load_shared_library("llama", ...)`）
+
+**为什么**：llama.cpp 的 Linux 官方包是 `GGML_BACKEND_DL=ON` 编的，后端是运行时插件，
+不显式加载就会 `no backends are loaded`。Windows 那份是静态注册，没有这个符号。
+
+**怎么改**：按 `libggml.so.0` → `libggml.so` → `ggml.dll` 的顺序找第一个存在的文件
+`ctypes.CDLL`；有 `ggml_backend_load_all_from_path` 就用它按 `base_path` 加载，
+否则退 `ggml_backend_load_all()`；Windows 跳过。
+
+**必须打开 `libggml.so.0` 而不是 `libggml.so`**：`libllama` 的 `DT_NEEDED` 是前者，
+打开后者会得到第二份 ggml 实例，后端注册进那一份，`libllama` 仍然报 no backends。
+注意这一条只对 DL 构建有意义——我们现在发的 Linux 库是静态后端，这段代码不触发。
 
 ## 已知边界
 

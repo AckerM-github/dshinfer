@@ -13,12 +13,28 @@ HTTP (FastAPI)  ──►  Service（准入/排队/超时/取消/埋点）──
 
 | `ENGINE` | 实现 | 进程模型 | 并发 | 前缀缓存 | 用在 |
 |---|---|---|---|---|---|
-| `inproc`（默认） | `vendor/llama_cpp` → `llama.dll`（容器里是同版本 manylinux wheel） | 同进程 | **1** | 只记得上一条 | 单人对话、要低延迟 |
+| `inproc`（默认） | `vendor/llama_cpp` → `llama.dll`；容器里是自建的 `dshinfer-engine` wheel | 同进程 | **1** | 只记得上一条 | 单人对话、要低延迟 |
 | `mock` | 纯 Python 假引擎 | 同进程 | 按配置 | 无 | 测试、压测、CI |
 
 > 曾经的 `llamacpp`（`llama-server.exe` 子进程、4 slot、跨会话前缀缓存）已于 2026-11-11 删除：
 > 单用户场景用不上它的槽位与多模型路由，而多进程本身每请求多 20–30 ms、还要多养一套进程看护。
 > 要回看那版实现：`git show 04fd0a3^:src/dshinfer/engine/llamacpp_server.py`。
+
+### 引擎怎么分发
+
+`vendor/llama_cpp` 是源码真相源；`packaging/` 把它和配套的原生库打成平台 wheel
+`dshinfer-engine`（`0.3.36.post1`）。装了这个 wheel，`import llama_cpp` 就有 GPU 能力，
+不需要编译器、不需要 CUDA Toolkit：
+
+```powershell
+python packaging\stage_native.py --platform win_amd64 --from-dir D:\llm\runtime\llama-inproc\bin
+python packaging\build_engine_wheel.py --platform win_amd64     # → packaging/dist/*.whl（1.58 GB）
+python packaging\build_index.py                                 # → packaging/index/simple/（PEP 503）
+```
+
+原生库与绑定**同源**（来自同一个 llama-cpp-python 0.3.36 cu124 构建），所以是
+「我们拥有分发、还不拥有编译」——这一点是踩出来的：拿 llama.cpp 官方 Linux 包（`GGML_BACKEND_DL=ON`）
+拼 0.3.36 绑定，decode 会跳 `0x100` 崩溃。经过见 `packaging/engine/README.md`。
 
 ## 分层与职责
 

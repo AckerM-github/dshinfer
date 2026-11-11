@@ -31,3 +31,7 @@ eval/latest.json
 # OS
 .DS_Store
 Thumbs.db
+
+# 打包：原生库与产物不入库（1.59 GB / 1.2 GB），只提交脚本与元数据
+packaging/native/
+packaging/dist/

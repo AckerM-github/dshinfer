@@ -42,6 +42,36 @@ _base_path = (
 # Load the library
 _lib = load_shared_library(_lib_base_name, _base_path)
 
+# 官方 Linux release（b12211 的 llama-*-bin-ubuntu-cuda-*.tar.gz）是用
+# GGML_BACKEND_DL=ON 编的：ggml 后端是运行时插件，注册表初始为空，不显式加载的话
+# llama_model_load_from_file 会直接失败，日志是
+#   "no backends are loaded. hint: use ggml_backend_load() or ggml_backend_load_all()"
+# Windows 那份 DLL 是静态注册（没有这些符号），getattr 拿不到就跳过，两边行为一致。
+#
+# 注意文件名：必须打开 **libggml.so.0**（libllama 的 DT_NEEDED 就是它）。
+# 打开 libggml.so 会加载出第二份 ggml 实例，后端注册进那一份，libllama 仍然说没人。
+# 我们的 wheel 里 .so / .so.0 / .so.0.29.0 是三个独立文件（zip 不能存符号链接），
+# 所以这个细节是必须的。
+for _cand in ("libggml.so.0", "libggml.so", "ggml.dll"):
+    _ggml_path = _base_path / _cand
+    if not _ggml_path.exists():
+        continue
+    try:
+        _ggml_lib = ctypes.CDLL(str(_ggml_path))
+    except OSError:
+        continue
+    _load_all_from_path = getattr(_ggml_lib, "ggml_backend_load_all_from_path", None)
+    _load_all = getattr(_ggml_lib, "ggml_backend_load_all", None)
+    if _load_all_from_path is not None:
+        _load_all_from_path.argtypes = [ctypes.c_char_p]
+        _load_all_from_path.restype = None
+        _load_all_from_path(str(_base_path).encode())
+    elif _load_all is not None:
+        _load_all.argtypes = []
+        _load_all.restype = None
+        _load_all()
+    break
+
 ctypes_function = ctypes_function_for_shared_library(_lib)
 
 

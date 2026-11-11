@@ -5,12 +5,17 @@
 # 和上一版的区别（上一版把 llama-server 当子进程黑盒）：
 #   1. 镜像里没有 llama-server，也没有 /opt/llama：引擎在服务进程内跑，
 #      指标、trace、日志、进程生命周期都只有一份。
-#   2. 引擎绑定不在容器里现编，而是用 llama-cpp-python 官方发布的 manylinux wheel
-#      （0.3.36，与本机 vendor/llama_cpp 同源），wheel 自带 libllama.so /
-#      libggml*.so / libggml-cuda.so —— 所以构建时不需要 nvcc，也不需要 CUDA Toolkit。
+#   2. 引擎装的是**本项目自建的 `dshinfer-engine` wheel**：Python 代码来自
+#      vendor/llama_cpp（与仓库同一份），原生库来自 llama.cpp 官方 release b12211
+#      （cuda-12.8 版，与本机 vendor 对应的 7d7f0287 是同一个提交）。
+#      所以构建时不需要 nvcc，也不需要 CUDA Toolkit。
 #   3. 基础镜像用 CUDA **runtime**（不是 devel）：只缺 libcublas / libcudart 时它已经带齐。
 #
 # 权重不进镜像层（5.24 GB，且实验期会换 Q4_K_M / Q3_K_M），由 compose 以只读卷挂到 /models。
+#
+# 构建前先打引擎 wheel（产物在 packaging/dist/，不入库）：
+#   python packaging/stage_native.py --platform manylinux_2_35_x86_64 --from-tarball <llama-b12211-bin-ubuntu-cuda-12.8-x64.tar.gz>
+#   python packaging/build_engine_wheel.py --platform manylinux_2_35_x86_64
 #
 # 构建：docker compose -f docker/compose.yaml build
 # 单跑：docker build -f docker/Dockerfile -t dshinfer:local .
@@ -70,13 +75,13 @@ RUN python3 -m venv /opt/venv \
  && /opt/venv/bin/pip install --no-cache-dir --require-hashes -r /tmp/requirements.lock \
  && rm -f /tmp/requirements.lock
 
-# 引擎绑定：官方 manylinux wheel（自带 libllama.so + libggml-cuda.so，无编译）。
+# 引擎：本项目自建的 wheel（Python 来自 vendor/llama_cpp，原生库是官方 b12211 的 .so）。
 # --no-deps：它的依赖（numpy / diskcache / jinja2 / typing-extensions）已经在上面那份锁里。
-# 原生 Windows 走 vendor/llama_cpp（同一份 Python 代码），两者版本必须一致。
-ARG LLAMA_CPP_VERSION=0.3.36
-ARG LLAMA_CPP_WHEEL_URL=https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.36-cu124/llama_cpp_python-0.3.36-py3-none-manylinux_2_35_x86_64.whl
+# 这个文件不入库（packaging/dist/ 在 .gitignore 里），必须在宿主编译前先跑两个打包脚本。
+COPY packaging/dist/dshinfer_engine-*-manylinux*.whl /tmp/engine/
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
-    /opt/venv/bin/pip install --no-deps "${LLAMA_CPP_WHEEL_URL}" \
+    /opt/venv/bin/pip install --no-deps /tmp/engine/dshinfer_engine-*.whl \
+ && rm -rf /tmp/engine \
  && /opt/venv/bin/python - <<'PY'
 import importlib.metadata as md
 import pathlib
@@ -85,14 +90,15 @@ import sysconfig
 # 只做静态检查，**不能 import llama_cpp**：它在模块级 dlopen libllama.so，
 # 而 libllama.so 依赖宿主驱动注入的 libcuda.so.1 —— 构建期没有，
 # 运行期由 nvidia container runtime 挂进来。见 §17。
-ver = md.version("llama-cpp-python")
-assert ver == "0.3.36", ver
+ver = md.version("dshinfer-engine")
+assert ver.startswith("0.3.36"), ver
 site = pathlib.Path(sysconfig.get_paths()["purelib"])
 lib = site / "llama_cpp" / "lib"
 names = sorted(p.name for p in lib.glob("lib*.so*"))
 assert any(n.startswith("libllama.so") for n in names), names
 assert any("ggml-cuda" in n for n in names), names
-print("llama-cpp-python", ver, "libs:", len(names), names)
+assert any(n.startswith("libggml-cpu") for n in names), names
+print("dshinfer-engine", ver, "libs:", len(names), names)
 PY
 
 # 工程本体：wheel 来自 wheel 阶段，--no-deps 保证不会再解析或升级任何依赖

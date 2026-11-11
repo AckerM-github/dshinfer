@@ -1,0 +1,27 @@
+[project]
+# 这是 dshinfer-engine 的元数据单一来源；wheel 由 packaging/build_engine_wheel.py 直接组装，
+# 不经过任何构建后端（没有 C 扩展，也不需要编译）。
+name = "dshinfer-engine"
+version = "0.3.36.post1"
+description = "llama.cpp in-process engine for dshinfer: vendored llama-cpp-python bindings plus platform native libraries"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "linc" }]
+keywords = ["llama.cpp", "gguf", "llm", "inference"]
+
+# 运行时依赖：与 llama-cpp-python 0.3.36 一致。
+# 容器里用 `pip install --no-deps`，这些由 docker/requirements.lock 提供。
+dependencies = [
+    "numpy",
+    "diskcache",
+    "jinja2",
+    "typing-extensions",
+]
+
+[project.urls]
+Homepage = "https://github.com/AckerM-github/dshinfer"
+Upstream = "https://github.com/abetlen/llama-cpp-python"
+
+# 说明：wheel 的平台标签（py3-none-win_amd64 / py3-none-manylinux_2_35_x86_64）
+# 由构建脚本按 --platform 参数写入 WHEEL 文件，不在这里声明。

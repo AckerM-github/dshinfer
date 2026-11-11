@@ -15,3 +15,7 @@ tests/
 # 权重不进构建上下文（模型靠挂卷）；models/ 里只有清单，镜像也不需要
 models/
 *.gguf
+# 打包中间产物：native/ 是两平台原生库的原样（2 GB 上下），镜像只要最终的 manylinux wheel
+packaging/native/
+# Windows 的 wheel 与 Linux 无关，别往构建上下文里塞 1.6 GB
+packaging/dist/*win_amd64*.whl
