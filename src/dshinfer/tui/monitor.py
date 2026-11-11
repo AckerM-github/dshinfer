@@ -4,14 +4,14 @@
     1 Overview   一眼看完：tok/s、显存、GPU、并发、上下文占用、MoE、系统内存、最近请求
     2 Serving    服务层视角：调度器队列、在飞、直方图（TTFT / 端到端 / 排队）
     3 Requests   单请求时间线：最近 N 条的 queued → TTFT → decode → total
-    4 Engine     引擎视角：llama-server 的全部原始指标（含投机解码）
+    4 Engine     引擎事实：模型/上下文/KV 量化/batch/GPU 层数/令牌与耗时
     5 Hardware   硬件明细：每张卡的 NVML 字段、CPU 每核占用、系统内存
-    6 Logs       引擎日志尾巴（容器里是 /var/log/dshinfer/llama-server.log）
+    6 Logs       服务日志尾巴（引擎在进程内，只有一个日志源）
     7 Connect    对外接口：URL、端点清单、模型元数据、怎么 curl
 
 数据来源都是本机回环 + NVML，所以面板本身不引入任何常驻进程（不用 Prometheus +
 Grafana，那套要多 300–500 MB 常驻内存，而 WSL 只有 7.5 GB）。q 退出时会问一句：
-后台继续跑（只关面板）还是把引擎停掉。
+后台继续跑（只关面板）还是把服务停掉。
 
 界面上的三个"活得像个真面板"的细节：
   · 顶栏有阶段条（空闲 / 加载 / 生成 / 排队 / 错误）和 [LIVE] / [STALE Ns] / [FROZEN] 状态，
@@ -84,25 +84,6 @@ VIEWS = [
     ("connect", "连接"),
 ]
 
-# 引擎指标的中文名（顺序就是 Engine 视图里的显示顺序，未知项排在最后）
-ENGINE_LABELS: list[tuple[str, str]] = [
-    ("prompt_tokens_total", "处理的 prompt 令牌"),
-    ("prompt_tokens_cached_total", "其中命中前缀缓存"),
-    ("tokens_predicted_total", "生成的令牌"),
-    ("tokens_predicted_seconds_total", "累计生成耗时（秒）"),
-    ("prompt_seconds_total", "累计预填充耗时（秒）"),
-    ("n_decode_total", "decode 次数"),
-    ("n_tokens_max", "单请求最长令牌"),
-    ("n_busy_slots_per_decode", "每次 decode 占用的 slot"),
-    ("requests_processing", "处理中的请求"),
-    ("requests_deferred", "被推迟的请求"),
-    ("predicted_tokens_seconds", "生成速度（引擎 gauge）"),
-    ("prompt_tokens_seconds", "预填充速度（引擎 gauge）"),
-    ("spec_decode_num_draft_tokens_total", "投机解码：草稿令牌"),
-    ("spec_decode_num_accepted_tokens_total", "投机解码：被接受"),
-]
-
-
 def _tone_rate(value: float | None) -> str:
     """生成速度：本机 32K 配置单流约 40 t/s，4 并发单条约 33 t/s。"""
     if not value:
@@ -145,7 +126,7 @@ def phase_line(snap: live.Snapshot, *, compact: bool = False) -> str:
         f"[bold reverse] {name} [/]" if idx == active else f"[dim]{name}[/]"
         for idx, name in enumerate(PHASES)
     )
-    used = snap.totals.get("n_tokens_max") or 0.0
+    used = snap.ctx_used or 0.0
     total = snap.ctx_limit or 0
     pct = used / total * 100 if total else 0.0
     if compact:
@@ -375,7 +356,7 @@ class OverviewView(VerticalScroll):
             total_mib or None,
         )
 
-        n_tokens_max = snap.totals.get("n_tokens_max") or 0.0
+        n_tokens_max = snap.ctx_used or 0.0
         cache_ratio = snap.cache.get("hit_ratio") or 0.0
         if compact:
             self.query_one("#ctx-line", Static).update(
@@ -385,9 +366,9 @@ class OverviewView(VerticalScroll):
             )
         else:
             self.query_one("#ctx-line", Static).update(
-                meter("上下文占用（单请求最长）", n_tokens_max, snap.ctx_limit or None, 18, unit="tokens")
+                meter("上下文占用（最近最长请求）", n_tokens_max, snap.ctx_limit or None, 18, unit="tokens")
                 + f"   [dim]前缀缓存命中[/] [{tone_for(cache_ratio, 20, 60)}]{cache_ratio:,.0f}%[/]"
-                + f"   [dim]已解码[/] {fmt_int(snap.totals.get('n_decode'))} 次"
+                + f"   [dim]完成请求[/] {fmt_int(snap.totals.get('n_decode'))} 次"
                 + f"   [dim]请求[/] {fmt_int(snap.service_req.get('total'))}"
             )
         self.query_one("#model-line", Static).update(self._model_line(snap, compact=compact))
@@ -505,11 +486,10 @@ class ServingView(VerticalScroll):
             ("生成令牌", fmt_int(snap.totals.get("tokens_predicted"))),
             ("prompt 令牌", fmt_int(snap.totals.get("prompt_tokens"))),
             ("命中前缀缓存", f"{fmt_int(snap.cache.get('hit_tokens'))}（{snap.cache.get('hit_ratio', 0):,.0f}%）"),
-            ("decode 次数", fmt_int(snap.totals.get("n_decode"))),
-            ("单请求最长令牌", fmt_int(snap.totals.get("n_tokens_max"))),
-            ("处理中 / 推迟", f"{snap.slots.get('processing', 0):,.0f} / {snap.slots.get('deferred', 0):,.0f}"),
-            ("每次 decode 的 slot", fmt_rate(snap.slots.get("busy"), " 个")),
-            ("投机解码 草稿/接受", f"{fmt_int(snap.totals.get('spec_draft'))} / {fmt_int(snap.totals.get('spec_accepted'))}"),
+            ("完成请求", fmt_int(snap.totals.get("n_decode"))),
+            ("累计生成耗时", f"{(snap.totals.get('decode_seconds') or 0):,.1f} s"),
+            ("处理中 / 排队", f"{snap.slots.get('processing', 0):,.0f} / {snap.slots.get('deferred', 0):,.0f}"),
+            ("序列数", "1（进程内一次一个 decode）"),
         ]
         fill_table(self.query_one("#serve-engine", DataTable), ["指标", "值"], engine_rows)
 
@@ -611,40 +591,50 @@ class EngineView(VerticalScroll):
 
     def compose(self) -> ComposeResult:
         yield Static("", id="engine-summary")
-        yield Static("[bold]llama-server 原始指标[/]", classes="section-title")
+        yield Static("[bold]引擎事实[/]（全部来自同一个服务进程）", classes="section-title")
         yield DataTable(id="engine-table")
 
     def apply(self, snap: live.Snapshot) -> None:
-        ready = (snap.health.get("engine") or {}).get("ready") if snap.health else None
-        load_seconds = (snap.health.get("engine") or {}).get("load_seconds") if snap.health else None
-        last_error = (snap.health.get("engine") or {}).get("last_error") if snap.health else None
+        health = snap.health or {}
+        engine = health.get("engine")
+        engine = engine if isinstance(engine, dict) else {}
+        ready = engine.get("ready")
+        load_seconds = engine.get("load_seconds")
+        last_error = engine.get("last_error")
         state = "就绪" if ready else ("加载中" if ready is False else "未知")
         self.query_one("#engine-summary", Static).update(
-            f"[dim]引擎[/] {snap.engine}"
+            f"[dim]引擎[/] {snap.engine or DASH}（进程内）"
             f"   [dim]状态[/] [{tone_for(100 if ready else 40)}]{state}[/]"
             f"   [dim]加载耗时[/] {fmt_seconds(load_seconds) if load_seconds else DASH}"
-            f"   [dim]地址[/] {snap.engine_url}"
+            f"   [dim]地址[/] {snap.service_url}"
             + (f"\n[red]最近错误：{last_error}[/]" if last_error else "")
         )
-        rows = []
-        known = {key for key, _ in ENGINE_LABELS}
-        for key, label in ENGINE_LABELS:
-            rows.append((label, key, _engine_value(snap.engine_metrics.get(key))))
-        for key in sorted(snap.engine_metrics):
-            if key in known or "{" in key:
-                continue
-            rows.append((key, key, _engine_value(snap.engine_metrics[key])))
-        fill_table(self.query_one("#engine-table", DataTable), ["指标", "原始键", "值"], rows)
-
-
-def _engine_value(value: float | None) -> str:
-    if value is None:
-        return DASH
-    if value >= 1000:
-        return f"{value:,.0f}"
-    if float(value).is_integer():
-        return f"{value:,.0f}"
-    return f"{value:,.2f}"
+        info = snap.model_info or {}
+        decode_seconds = snap.totals.get("decode_seconds") or 0.0
+        rows = [
+            ("模型", snap.model or DASH, "/v1/models"),
+            ("上下文", f"{snap.ctx_limit:,}" if snap.ctx_limit else DASH, "/admin/config"),
+            (
+                "KV 量化",
+                f"{info.get('cache_type_k', DASH)}/{info.get('cache_type_v', DASH)}",
+                "/admin/config",
+            ),
+            (
+                "batch / ubatch",
+                f"{info.get('n_batch', DASH)}/{info.get('n_ubatch', DASH)}",
+                "/admin/config",
+            ),
+            ("GPU 层数", str(info.get("n_gpu_layers", DASH)), "/admin/config"),
+            ("FlashAttention", "on" if info.get("flash_attn") else "off", "/admin/config"),
+            # inproc 一个 context 一次只跑一个 decode，这两个数恒为 1
+            ("序列数 / 并发", "1 / 1", "/admin/config"),
+            ("输入令牌", f"{snap.tokens.get('input', 0):,}", "/metrics"),
+            ("生成令牌", f"{snap.tokens.get('output', 0):,}", "/metrics"),
+            ("命中前缀缓存", f"{snap.tokens.get('cached', 0):,}", "/metrics"),
+            ("累计生成耗时", f"{decode_seconds:,.1f} s", "/metrics"),
+            ("平均生成速度", f"{snap.tok_s:.1f} t/s", "/metrics"),
+        ]
+        fill_table(self.query_one("#engine-table", DataTable), ["项", "值", "来源"], rows)
 
 
 class HardwareView(VerticalScroll):
@@ -770,9 +760,9 @@ class ConnectView(VerticalScroll):
                     f"  上下文    {snap.ctx_limit:,}（模型训练上下文 {info.get('n_ctx_train') or DASH:,}）",
                     f"  健康      {base}/healthz",
                     "",
-                    "[bold]引擎（llama-server，仅容器内/本机可见）[/]",
-                    f"  指标      {snap.engine_url}",
-                    f"  日志      {self.preset.engine_log_path or DASH}",
+                    "[bold]引擎（进程内，与服务同进程）[/]",
+                    f"  指标      {base}/metrics",
+                    f"  日志      {self.preset.service_log_path or DASH}",
                     "",
                     "[bold]端点[/]",
                     "  GET  /v1/models              模型列表（含 loaded 标记）",
@@ -825,13 +815,11 @@ class MonitorApp(App[None]):
         self,
         preset: Preset,
         *,
-        engine_url: str | None = None,
         service_url: str | None = None,
         interval: float = 2.0,
     ) -> None:
         super().__init__()
         self.preset = preset
-        self.engine_url = engine_url or f"http://127.0.0.1:{preset.engine_port}/metrics"
         self.service_url = service_url or f"http://{_loopback(preset.host)}:{preset.port}"
         self.interval = max(0.5, interval)
         self._started = time.monotonic()
@@ -863,7 +851,7 @@ class MonitorApp(App[None]):
             RequestsView(),
             EngineView(),
             HardwareView(),
-            LogsView(self.preset.engine_log_path),
+            LogsView(self.preset.service_log_path),
             ConnectView(self.preset),
         )
         yield Static("", id="hintbar")
@@ -896,7 +884,6 @@ class MonitorApp(App[None]):
         try:
             snap = await asyncio.to_thread(
                 live.sample_snapshot,
-                engine_url=self.engine_url,
                 service_url=self.service_url,
                 model=self.preset.model_stem,
                 ctx_limit=self.preset.n_ctx,

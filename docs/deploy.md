@@ -15,7 +15,7 @@
 | | A：Windows 原生 | B：本机容器 / 云 | 备注 |
 |---|---|---|---|
 | 服务层进程 | `.venv\Scripts\python.exe -m dshinfer.main` | `/opt/venv/bin/python -m dshinfer.main`（容器内） | 同一份 `src/` |
-| 引擎 | 默认 `inproc`：进程内 `vendor/llama_cpp` → `llama.dll`（并发 1）；`ENGINE=llamacpp` 才拉 `D:\llm\runtime\llama.cpp\llama-server.exe` | `/opt/llama/bin/llama-server`（子进程，4 slot） | 引擎是接口，换实现不动服务层；容器里 `docker.env` 强制回 `llamacpp` |
+| 引擎 | 默认 `inproc`：进程内 `vendor/llama_cpp` → `llama.dll`（并发 1） | 同样 `inproc`：manylinux wheel 自带的 `libllama.so`（也是 0.3.36 / cu124） | 引擎是接口，换实现不动服务层；两形态现在都是单进程 |
 | GPU 供给 | 宿主驱动 + `ggml-cuda.dll` | nvidia-container-toolkit 注入 `libcuda.so.1` | 唯一无法消除的差异，收敛在 compose 硬件段 |
 | 权重 | `D:\llm\models\gguf` | `/models`（只读 bind 或卷） | 5.2 GB 不进镜像 |
 | 日志 | `D:\llm\runtime\*.log` | `/var/log/dshinfer`（named volume） | |
@@ -29,8 +29,8 @@
 | 文件 | 进 git | 内容 | 谁读它 |
 |---|---|---|---|
 | `config/base.env` | 是 | 调优参数：上下文、KV 量化、并发、批大小、`FIT`…**零绝对路径** | 容器：`env_file` + 镜像内 `/app/runtime/base.env`；原生：`config.py` 自动加载 |
-| `config/docker.env` | 是 | 只在容器里有意义的路径：`/models`、`/opt/llama/bin/llama-server`、`/var/log/dshinfer/...` | 容器（`env_file` + 镜像内副本） |
-| 本机 `.env` | 否（`.gitignore`） | 本机路径：`D:\llm\models\gguf`、`D:\llm\runtime\llama.cpp\llama-server.exe`… | `config.py` 自动加载（模板见 `.env.example`） |
+| `config/docker.env` | 是 | 只在容器里有意义的路径：`/models`、`/app/runtime`、`/var/log/dshinfer/...` | 容器（`env_file` + 镜像内副本） |
+| 本机 `.env` | 否（`.gitignore`） | 本机路径：`D:\llm\models\gguf`、`D:\llm\runtime\llama-inproc\bin`… | `config.py` 自动加载（模板见 `.env.example`） |
 
 生效优先级（高 → 低，pydantic-settings 的规则）：
 
@@ -39,7 +39,7 @@
 ```
 
 * **平台默认值**写在 `src/dshinfer/config.py` 的 `_default_*()` 里：`os.name == "nt"` 走 D 盘，
-  其它平台走 `/opt/llama`、`/models`、`/var/log/dshinfer`（不可写就退到 `~/.local/state/dshinfer`）。
+  其它平台走 `/models`、`/var/log/dshinfer`（不可写就退到 `~/.local/state/dshinfer`）。
   所以「新克隆没有 .env」也能在两种机器上各自跑起来，不需要谁去改代码。
 * 容器里的搜索顺序是 `/app/runtime/base.env` → `/app/runtime/docker.env` → 仓库 `config/base.env` → `.env`，
   后读到的覆盖先读到的；镜像里那两份是 `Dockerfile` 从同一个 `config/` 拷进去的，
@@ -65,8 +65,8 @@ docker exec dshinfer curl -s http://127.0.0.1:8000/admin/config
 返回的契约键（跨机器必须一致）：
 
 `engine / model_name / gguf_file / gguf_bytes / n_ctx / cache_type_k / cache_type_v /
-n_parallel / max_concurrency / kv_unified / n_batch / n_ubatch / flash_attn /
-slot_pinning / fit / n_gpu_layers / enable_thinking`
+n_parallel / max_concurrency / n_batch / n_ubatch / flash_attn /
+n_gpu_layers / enable_thinking`
 
 以及只做参考的 `platform`（`win32` / `linux`）。路径类字段**故意不报**：三种形态天生不同，
 报出来只会制造假差异。
@@ -176,13 +176,13 @@ sudo unshare -m --propagation private bash -c '
 |---|---|
 | `test_base_env_is_the_only_tuning_source` | 调优键只能出现在 `config/base.env`；`compose.yaml` 抄一遍就红 |
 | `test_base_env_has_no_machine_paths` | `base.env` 里不许出现盘符、`/mnt`、任何以 `/` 开头的绝对路径 |
-| `test_docker_env_only_mentions_container_paths` | `docker.env` 的绝对路径只能是 `/models`、`/opt/llama`、`/app`、`/var/log/dshinfer` |
+| `test_docker_env_only_mentions_container_paths` | `docker.env` 的绝对路径只能是 `/models`、`/app`、`/var/log/dshinfer` |
 | `test_compose_base_layer_has_no_host_paths` | 基础 compose 层零 Windows 路径、零反斜杠；权重占位符必须是中性的 `/models` |
 | `test_wsl_overlay_only_holds_machine_specifics` | WSL 覆盖层只许放「权重真实目录 + 覆盖率」这类机器事实，不许挂 `/mnt` |
 | `test_dockerfile_ships_the_contract_and_no_host_paths` | 镜像必须把 `config/base.env` 与 `config/docker.env` 拷进去 |
 | `test_sources_do_not_hardcode_host_paths` | `src/` 除 `config.py` / `preset.py` 外不许出现宿主路径 |
 | `test_env_example_only_overrides_paths` | `.env.example` 只放路径覆盖项，不再抄调优参数 |
-| `test_settings_defaults_follow_platform` | 平台默认值真的分叉：Windows 出 D 盘，Linux 出 `/opt/llama` |
+| `test_settings_defaults_follow_platform` | 平台默认值真的分叉：Windows 出 D 盘，Linux 出 `/var/log/dshinfer` 与 `/models` |
 
 ## 8. 故障判定表
 

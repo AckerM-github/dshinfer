@@ -4,18 +4,21 @@
 而是把「一个模型怎么变成线上服务」这件事的每一层都摊开：协议、并发、背压、流式、取消、观测。
 
 ```
-HTTP (FastAPI)  ──►  Service（准入/排队/超时/取消/埋点）──►  Engine（协议）──►  Mock / inproc / llama-server
+HTTP (FastAPI)  ──►  Service（准入/排队/超时/取消/埋点）──►  Engine（协议）──►  Mock / inproc（进程内 libllama）
        ▲                                                                          │
        └────────────────────── SSE / JSON ◄── TokenEvent ◄────────────────────────┘
 ```
 
-三种引擎，同一套服务层：
+两种引擎，同一套服务层：
 
 | `ENGINE` | 实现 | 进程模型 | 并发 | 前缀缓存 | 用在 |
 |---|---|---|---|---|---|
-| `inproc`（默认） | `vendor/llama_cpp` → `llama.dll` | 同进程 | **1** | 只记得上一条 | 单人对话、要低延迟 |
-| `llamacpp` | `llama-server.exe` 子进程 | 跨进程 | 4 slot | 4 条会话各留一份（87–97% 命中） | 多会话、要吞吐；容器里只有它 |
+| `inproc`（默认） | `vendor/llama_cpp` → `llama.dll`（容器里是同版本 manylinux wheel） | 同进程 | **1** | 只记得上一条 | 单人对话、要低延迟 |
 | `mock` | 纯 Python 假引擎 | 同进程 | 按配置 | 无 | 测试、压测、CI |
+
+> 曾经的 `llamacpp`（`llama-server.exe` 子进程、4 slot、跨会话前缀缓存）已于 2026-11-11 删除：
+> 单用户场景用不上它的槽位与多模型路由，而多进程本身每请求多 20–30 ms、还要多养一套进程看护。
+> 要回看那版实现：`git show 04fd0a3^:src/dshinfer/engine/llamacpp_server.py`。
 
 ## 分层与职责
 
@@ -36,7 +39,7 @@ HTTP (FastAPI)  ──►  Service（准入/排队/超时/取消/埋点）──
 ```powershell
 cd D:\llm\infer
 uv sync                              # 首次：建 .venv 装依赖
-uv run pytest -q                     # 7 个测试，ASGI 直连不占端口
+uv run pytest -q                     # 130 个用例，ASGI 直连不占端口
 uv run uvicorn dshinfer.api:app --port 8000
 ```
 
@@ -75,27 +78,22 @@ curl.exe -s -X POST http://127.0.0.1:8000/v1/chat/completions `
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `ENGINE` | `inproc` | `inproc`（进程内 `vendor/llama_cpp`，并发 1）/ `llamacpp`（子进程 4 slot）/ `mock`（测试） |
+| `ENGINE` | `inproc` | `inproc`（进程内 `vendor/llama_cpp`，并发 1）/ `mock`（测试） |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | 监听地址 |
-| `MAX_CONCURRENCY` | `4` | 同时在飞的请求上限（必须 ≤ `N_PARALLEL`） |
+| `MAX_CONCURRENCY` | `1` | 同时在飞的请求上限；进程内引擎一次只 decode 一个，>1 只是排在那把锁上 |
 | `QUEUE_LIMIT` | `64` | 排队上限，超了直接 429（背压） |
 | `QUEUE_TIMEOUT_S` | `30` | 排队超时 |
 | `REQUEST_TIMEOUT_S` | `180` | 单请求生成总超时 |
 | `GGUF_PATH` | `D:\llm\models\gguf\...Q4_K_M.gguf` | 量化权重路径 |
-| `LLAMA_SERVER_PATH` | `D:\llm\runtime\llama.cpp\llama-server.exe` | 引擎可执行文件（`ENGINE=llamacpp`） |
 | `INPROC_LIB_DIR` | `D:\llm\runtime\llama-inproc\bin` | 进程内引擎的 DLL 目录（`ENGINE=inproc`），与 `vendor/llama_cpp` 同源 |
-| `ENGINE_PORT` | `8124` | 引擎子进程监听端口 |
 | `N_GPU_LAYERS` | `-1` | 全部层上 GPU |
-| `N_CTX` | `65536` | **所有槽位共享**的上下文总额；配合 `KV_UNIFIED` 时单请求可用满 |
+| `N_CTX` | `65536` | 单个请求最多能用多少（进程内只有一个 context） |
 | `CACHE_TYPE_K` / `CACHE_TYPE_V` | `q8_0` / `q8_0` | KV 量化；q8 让上下文翻倍（32K→64K），PPL +0.09%，速度不变 |
-| `N_PARALLEL` | `4` | 引擎槽位数（`-np`）；配合 `KV_UNIFIED` 时槽位共享上下文池 |
-| `KV_UNIFIED` | `true` | 统一 KV 池：不按槽位预留，单请求可用满 `N_CTX`（llama.cpp 版的按需分配） |
+| `N_PARALLEL` | `1` | 引擎序列数；进程内引擎恒为 1，只用于校验与展示 |
 | `N_BATCH` / `N_UBATCH` | `2048` / `1024` | 逻辑批 / 微批；`N_UBATCH=1024` 让预填充快约 10% |
 | `FLASH_ATTN` | `true` | FlashAttention；关掉明显变慢也更费显存 |
 | `CHAT_TEMPLATE_PATH` | `D:\llm\runtime\chat_template.jinja` | 模型自带模板 |
 | `ENABLE_THINKING` | `false` | `true` 时思考过程走 `reasoning_content`，不混进正文 |
-| `SLOT_PINNING` | `true` | 把槽位作为 `id_slot` 传给引擎，会话钉在同一槽位；多步对话命中率 0%→100% |
-| `CACHE_REUSE` | `0` | 引擎的 `--cache-reuse N`；本模型 26/33 层是线性注意力，共享前缀无法复用（见 `docs/perf.md` §5.2） |
 | `MOCK_TTFT_MS` / `MOCK_TOKENS_PER_SECOND` | `120` / `40` | 假引擎的延迟模型 |
 
 ## 已实现的服务层策略
@@ -109,13 +107,20 @@ curl.exe -s -X POST http://127.0.0.1:8000/v1/chat/completions `
 
 ## Phase 1：接真模型（已完成）
 
+> 本节与 Phase 2/3 的数字都来自**已删除的 llamacpp 子进程形态**（4 槽位、`llama-server.exe`），
+> 保留作对照基线；现役形态只有一个 context，这些槽位/并发数字不再可复现。
+
 目标模型 `xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic`（9.41B 参数，Qwen3.5 混合架构：
 33 层里 24 层线性注意力 + 8 层全注意力，另有 MTP 头和视觉塔）。8 GB 显存只能跑量化版。
 
-**为什么用 `llama-server.exe` 而不是 llama-cpp-python**：PyPI 上的预编译轮子最新只到 0.3.4
-（2025 年初），不认识 `qwen35` 这个架构（GGUF 元数据 `general.architecture = qwen35`）。
-官方 `llama.cpp b12202` 已经支持，所以把 `llama-server` 当子进程黑盒，我们只负责 prompt 和 token 流。
-这不是妥协：**引擎负责算，服务层负责调度**，本来就是 vLLM 之类系统的分层方式。
+**当初为什么用 `llama-server.exe` 子进程**：PyPI 上的预编译轮子当时只到 0.3.4（2025 年初），
+不认识 `qwen35` 这个架构（GGUF 元数据 `general.architecture = qwen35`）；官方 `llama.cpp b12202`
+已经支持，所以把 `llama-server` 当子进程黑盒，我们只负责 prompt 和 token 流。
+
+**后来为什么又搬回进程内**：`llama-cpp-python` 0.3.36 的 cu124 wheel 自带 CUDA 版 `libllama`，
+不装 Toolkit、不编译就能在本机跑；顺手发现我们的 GGUF 元数据本身有矛盾（`block_count=33`
+但只有 32 层张量），修好后两个引擎的输出逐字符一致。于是引擎换成了进程内绑定：
+省 20–30 ms/请求、KV 与 batch 全部可见，代价是并发退化到 1、C 层崩溃会带走整个服务。
 
 踩过的两个坑：
 
@@ -137,13 +142,17 @@ curl.exe -s -X POST http://127.0.0.1:8000/v1/chat/completions `
 | 非流式 35 token | 1.43 s |
 
 ```powershell
-$env:DSHINFER_ENGINE="llamacpp"
-uv run uvicorn dshinfer.api:app --port 8000   # 启动时会自动拉起 llama-server 子进程
+uv run uvicorn dshinfer.api:app --port 8000   # 引擎在进程内加载（默认 inproc）
 ```
 
 ## Phase 2：调度（已完成）
 
-把「信号量先到先服务」换成 `scheduler.py` 里的四级策略。**为什么服务层要自己调度**：
+把「信号量先到先服务」换成 `scheduler.py` 里的四级策略。
+
+> 下表的「槽位」语境属于已删除的 llamacpp 形态；现在只剩一个 context，优先级/老化/配额仍在队列层生效，
+> 只是“抢槽位”退化成了“抢那把 decode 锁”。
+
+**为什么服务层要自己调度**：
 引擎批的是 token 步，服务层批的是请求。请求这一层能做的策略比想象中多。
 
 | 策略 | 解决什么 | 实现 |
@@ -151,7 +160,7 @@ uv run uvicorn dshinfer.api:app --port 8000   # 启动时会自动拉起 llama-s
 | 优先级 | 离线批量把交互式请求堵在后面 | `X-Priority` 头，数值大的先派 |
 | 老化 | 低优先级永远轮不到（饿死） | 每等 `aging_s` 秒等效优先级 +1 |
 | 租户配额 | 一个用户开 50 个并发吃光槽位 | `per_tenant_inflight` / `per_tenant_queue` |
-| 前缀亲和 | 系统提示词每次重算 | prompt 前 512 字符哈希 → 固定 `id_slot` |
+| 前缀亲和 | 系统提示词每次重算 | prompt 前 512 字符哈希（或 `X-Session-Id`）→ 固定会话键 |
 
 「连续批处理」不在这一层——那是引擎的活（它得管 KV 页和 token 步）。服务层的对应物是
 **准入 + 排队 + 亲和**，这三件事做对了，尾延迟就差好几倍。
@@ -249,11 +258,13 @@ uv run python scripts/bench_load.py   # 四档并发 × 服务/原生两个端�
 
 ## 已知限制
 
-- 没有连续批处理：`llama-server` 自己按槽位跑，我们只能在**请求级**排队；真做 continuous batching 得自己管 KV。
-- 没有前缀缓存复用策略：只开了 `cache_prompt`，靠引擎自己算最长公共前缀。而且本模型
-  26/33 层是线性注意力（recurrent），**跨请求共享前缀在架构上就不可复用**，不是配置问题（§5.2 有 A/B 证据）。
-- 没有鉴权、没有多模型路由、没有 Prometheus 之外的追踪。
-- `enable_thinking=true` 时思考过程会混在正文里（还没拆 `reasoning_content`）。
+- 没有连续批处理：进程内引擎一次只跑一个 decode，多请求只能排队；真做 continuous batching 得自己管
+  `llama_batch` 与 KV 页（`llamacpp` 那版靠的是 llama-server 内部的槽位调度，已随删）。
+- 跨请求前缀复用在**架构上**不可得：本模型 26/33 层是线性注意力（recurrent），没有可复用的 KV 页，
+  不是配置问题（`docs/perf.md` §5.2 有 A/B 证据）；同一条会话内的续写仍能命中（19 token 里只重算 1 个）。
+- 没有鉴权、没有多模型路由、没有 Prometheus 之外的追踪；C 层崩溃会带走整个服务（子进程版能隔离）。
+- `ENABLE_THINKING=false` 时思考走 `reasoning_content`（`ThinkSplitter` 已实现）；打开后推理会占用
+  `max_tokens`，长回答会被截断。
 
 ## 路线
 
@@ -279,7 +290,7 @@ D:\llm\infer
 ├─ pyproject.toml
 ├─ config\
 │  ├─ base.env         调优唯一来源（上下文 / KV / 并发 / 批大小…，两形态共用）
-│  └─ docker.env       容器专属路径（/models、/opt/llama、/var/log/dshinfer）
+│  └─ docker.env       容器专属路径（/models、/var/log/dshinfer）
 ├─ .env                本机路径覆盖（不提交；调优默认值见 config/base.env）
 ├─ src\dshinfer\
 │  ├─ api.py          路由 / SSE / 错误映射
@@ -298,7 +309,7 @@ D:\llm\infer
 │     ├─ base.py      Engine 协议 / TokenEvent / Usage
 │     ├─ mock.py      假引擎（可控 TTFT 与速度）
 │     ├─ manager.py   引擎生命周期 + 热切换
-│     ├─ llamacpp_server.py  llama-server 子进程适配器
+│     ├─ inproc.py    进程内适配器（vendor/llama_cpp → llama.dll）
 │     └─ __init__.py  build_engine()
 ├─ scripts\
 │  ├─ probe_llamaserver.py  直连引擎的探针

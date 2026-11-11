@@ -18,10 +18,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-      args:
-        # 与 Windows 侧 D:\llm\runtime\llama.cpp 保持同一个 build，才能对着旧基准数据比
-        LLAMA_BUILD: "12202"
-        LLAMA_CUDA: "12.8"
+      # 引擎是进程内的 llama-cpp-python：没有 llama-server 可下，也就没有 build args。
     image: dshinfer:local
     container_name: dshinfer
     restart: unless-stopped

@@ -57,7 +57,7 @@ cd ~/infer && uv run --extra tui python -m dshinfer.tui --monitor
 bash docker/ops.sh tui
 ```
 
-第 ③ 种是唯一能看到**引擎侧指标**的方式：`llama-server` 监听容器内的 `127.0.0.1:8124`，
+第 ③ 种是历史上能看到**引擎侧指标**的方式（当时引擎还是独立进程，监听 `127.0.0.1:8124`）；
 没有发布到宿主，只有和它同 netns 的面板能抓 `/metrics`。宿主上看盘时引擎那一栏会写
 「引擎指标读不到」——这是刻意的提示，不是 bug。
 
@@ -91,7 +91,7 @@ uv run --extra tui python -m dshinfer.tui --preset ~/.config/dshinfer/presets/32
 | 5 | 图片 | mmproj 投影文件；没有就「不使用」 | `mmproj` |
 | 6 | 并发 | 1 / 2 / 4 / 8（同时设引擎 slot 与服务层并发） | `n_parallel` `max_concurrency` |
 | 7 | 调优 | balanced(2048/1024) / conservative(512/512) / prefill(4096/2048) | `n_batch` `n_ubatch` |
-| 8 | 高级 | 引擎端口、llama-server 路径、引擎日志路径 | `engine_port` `llama_server_path` `engine_log_path` |
+| 8 | 高级 | 服务日志路径（引擎在服务进程内，只有这一份日志） | `service_log_path` |
 | 9 | 访问 | 仅本机 127.0.0.1 / 局域网 0.0.0.0 / 自定义 host:port | `host` `port` |
 | 10 | 保存 | 命名 + 保存并启动监视器 / 只保存 | 落两份文件 |
 
@@ -117,9 +117,9 @@ uv run --extra tui python -m dshinfer.tui --preset ~/.config/dshinfer/presets/32
 | 1 | 概览 Overview | 生成速度（大字 tok/s + 单条/聚合）、显存 used/总 + 余量、GPU 利用率/温度/功耗/PCIe、并发（在飞/排队/引擎推迟）、tok/s 与显存两条曲线、上下文占用条、模型结构（架构/层数/头/FFN/MoE）、系统内存与 CPU、最近 8 条请求 |
 | 2 | 服务 Serving | 三个速率的原始值、在飞/队列、调度事件（dispatch/enqueue）、引擎累计表（生成令牌、prompt、前缀缓存命中、decode 次数…）、三组延迟直方图（TTFT / 端到端 / 排队 的 p50/p95/均值/样本） |
 | 3 | 请求 Requests | 最近 24 条的单请求时间线：排队 → TTFT → decode → 总耗时，输入/输出/缓存令牌 |
-| 4 | 引擎 Engine | `llama-server /metrics` 的**全部**原始指标（中文名 + 原始键 + 值），已知的按固定顺序在前，其余按名字补齐 |
+| 4 | 引擎 Engine | 引擎事实表：模型 / 上下文 / KV 量化 / batch·ubatch / GPU 层数 / FlashAttention / 序列数·并发 / 输入·生成令牌 / 命中缓存 / 累计耗时 / 平均 tok/s，每行标出来源端点 |
 | 5 | 硬件 Hardware | 每张卡的显存/利用率/带宽/温度/功耗/PCIe gen×width/风扇/频率，每个逻辑核的占用条，系统内存，采集后端（`nvml:windows` / `nvml:linux`） |
-| 6 | 日志 Logs | 引擎日志尾部（`/var/log/dshinfer/llama-server.log`），增量读取、轮转自动归零 |
+| 6 | 日志 Logs | 服务日志尾部（`/var/log/dshinfer/service.log`），增量读取、轮转自动归零 |
 | 7 | 连接 Connect | 接口地址、模型 ID、上下文、健康状态、端点清单、可直接复制的 curl |
 
 关键约定：**面板自己不监听端口、不写文件**（除了读日志的读位置在内存里），
@@ -131,7 +131,7 @@ uv run --extra tui python -m dshinfer.tui --preset ~/.config/dshinfer/presets/32
 | --- | --- | --- |
 | NVML（`probe.py`，ctypes 直读） | 显存 used/total/free、利用率、带宽、温度、功耗、PCIe、风扇、核心/显存频率 | `backend="none"` + `error` 原因；单项不支持置空显示 `—` |
 | CPU / 内存（本机 sysfs / psutil 等价物） | 每核占用、load1、总内存 used/available | 同上 |
-| `127.0.0.1:8124/metrics`（引擎） | `llamacpp:` 前缀的 15 项指标：累计令牌、decode 次数、slot processing/deferred、投机解码、KV 缓存命中 | 概览显示「引擎指标读不到」，其余照常 |
+| ~~`127.0.0.1:8124/metrics`（引擎）~~ | 已随 llamacpp 引擎删除；引擎指标现在就是服务指标（`dshinfer_*`） | 不再有第二个端点 |
 | `127.0.0.1:8000/metrics`（服务层） | 请求数/令牌数直方图（TTFT、端到端、排队）、在飞、队列深度、调度事件 | 延迟表空、令牌累计显示 0 |
 | `/admin/traces?limit=24` | 单请求时间线 | 最近请求表空 |
 | GGUF 文件头（`gguf.py`） | 架构、层数、头数、FFN、上下文上限、MoE 的 expert 数/激活数、文件大小 | 文件读不到就整块 `—` |
@@ -210,13 +210,13 @@ moe_summary = {"is_moe": false, ...}
    但顺序变成"先移除、下一帧再挂载"——用 `call_after_refresh` 串起来才稳定（否则焦点丢失）。
 2. **别用 `TabbedContent` 切视图**：Tabs 会吃掉 ←/→，和视图切换的快捷键抢事件。
    改成 7 个 `VerticalScroll` 叠着，用 `display` 切。
-3. **`/healthz` 的 `engine` 是对象不是字符串**（`{"engine":"llama-server","ready":true,...}`）；
+3. **`/healthz` 的 `engine` 是对象不是字符串**（`{"engine":"llama.cpp-inproc","ready":true,...}`）；
    上一版网页面板写成 `health.engine.ready`，就永远是"引擎未就绪"。
 4. **`n_ctx` 与 `max_context_tokens` 是两个字段**：前者是引擎实跑（容器里被
    `DSHINFER_N_CTX=32768` 覆盖），后者是模型训练上限 262144。面板主显前者，后者放括号里。
 5. **容器里资源是只读挂进去的**：`/models:ro`（权重）、日志卷（可写）。面板只读它们，
    不需要任何写权限；日志卷是可写的。
-6. **容器内路径要自适应**：`preset.py` 用「`/models` 存在且 `/opt/llama/bin/llama-server` 存在」
+6. **容器内路径要自适应**：`preset.py` 用「`/.dockerenv` 存在」
    判断自己在镜像里，默认值随之变成容器路径；宿主上仍是 `~/models` / `D:\\llm\\models\\gguf`。
 
 ## 9. 截图是怎么出的

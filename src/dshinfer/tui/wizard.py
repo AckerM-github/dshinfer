@@ -73,9 +73,8 @@ STEPS: list[tuple[str, str, str]] = [
     (
         "advanced",
         "高级",
-        "引擎端口、llama-server 可执行文件、引擎日志路径。容器里这些是固定约定"
-        "（/opt/llama/bin/llama-server、/var/log/dshinfer/llama-server.log），"
-        "本机原生跑才需要改。",
+        "服务日志写到哪里。引擎在服务进程内，没有引擎端口、没有引擎可执行文件，"
+        "容器里固定是 /var/log/dshinfer/service.log，本机原生跑才需要改。",
     ),
     (
         "access",
@@ -365,21 +364,21 @@ class WizardApp(App[Preset | None]):
 
     def _build_concurrency(self) -> list:
         rows = [
-            ("conc:1", "1 路 · 单流最低延迟，聚合吞吐最低"),
-            ("conc:2", "2 路 · 折中"),
-            ("conc:4", "4 路 · 推荐（聚合 42 → 110 t/s）"),
-            ("conc:8", "8 路 · 超过显存能撑的 KV，只会加排队"),
+            ("conc:1", "1 路 · inproc 引擎一个 context 一次只跑一个 decode，只有这一档"),
         ]
         return [
             self._label("并发路数"),
-            self._note(f"当前：n_parallel={self.preset.n_parallel} / max_concurrency={self.preset.max_concurrency}"),
+            self._note(
+                f"当前：n_parallel={self.preset.n_parallel} / "
+                f"max_concurrency={self.preset.max_concurrency}"
+            ),
+            self._note("进程内引擎只有一个 context：要真并发得给每个请求配一个 llama_context"),
             self._options([Option(label, id=option_id) for option_id, label in rows]),
         ]
 
     def _choose_concurrency(self, value: str) -> None:
-        count = int(value.split(":", 1)[1])
-        self.preset.n_parallel = count
-        self.preset.max_concurrency = count
+        self.preset.n_parallel = 1
+        self.preset.max_concurrency = 1
         self._goto(6)
 
     # ------------------------------------------------------------ 第 7 步：调优
@@ -409,36 +408,21 @@ class WizardApp(App[Preset | None]):
         else:
             self.preset.n_batch, self.preset.n_ubatch = 4096, 2048
             self.preset.flash_attn = True
-        self.preset.kv_unified = True
         self._goto(7)
 
     # ------------------------------------------------------------ 第 8 步：高级
 
     def _build_advanced(self) -> list:
         return [
-            self._label("高级：引擎进程"),
-            self._note("容器内请不要改这三项，它们对应镜像里的固定路径"),
-            Static("引擎端口", classes="field-label"),
-            Input(value=str(self.preset.engine_port), id="adv-port", type="integer"),
-            Static("llama-server 路径", classes="field-label"),
-            Input(value=self.preset.llama_server_path, id="adv-server"),
-            Static("引擎日志路径", classes="field-label"),
-            Input(value=self.preset.engine_log_path, id="adv-log"),
+            self._label("高级：服务日志"),
+            self._note("监视器的 Logs 视图 tail 这个文件；原生默认 D:\\llm\\runtime\\service.log"),
+            Static("服务日志路径", classes="field-label"),
+            Input(value=self.preset.service_log_path, id="adv-log"),
             self._note("改完按 Enter 保存并进入下一步"),
         ]
 
     def _submit_advanced(self, widget_id: str, raw: str) -> None:
-        if widget_id == "adv-port":
-            try:
-                port = int(raw.strip() or self.preset.engine_port)
-            except ValueError:
-                self.notify("端口要是数字", severity="error")
-                return
-            self.preset.engine_port = port
-        elif widget_id == "adv-server":
-            self.preset.llama_server_path = raw.strip()
-        else:
-            self.preset.engine_log_path = raw.strip()
+        self.preset.service_log_path = raw.strip() or self.preset.service_log_path
         self._goto(8)
 
     # ------------------------------------------------------------ 第 9 步：访问
@@ -491,8 +475,8 @@ class WizardApp(App[Preset | None]):
             f"[dim]上下文[/]    {p.n_ctx:,} · KV {p.cache_type_k}/{p.cache_type_v}",
             f"[dim]图片[/]      {p.mmproj or '未启用'}",
             f"[dim]并发[/]      n_parallel={p.n_parallel} · max_concurrency={p.max_concurrency}",
-            f"[dim]调优[/]      batch {p.n_batch}/{p.n_ubatch} · FA {'on' if p.flash_attn else 'off'} · KV 统一 {'on' if p.kv_unified else 'off'}",
-            f"[dim]引擎[/]      {p.engine} · 端口 {p.engine_port}",
+            f"[dim]调优[/]      batch {p.n_batch}/{p.n_ubatch} · FA {'on' if p.flash_attn else 'off'}",
+            f"[dim]引擎[/]      {p.engine}（进程内）· 日志 {p.service_log_path}",
             f"[dim]访问[/]      {p.host}:{p.port}",
         ]
         problems = p.problems()

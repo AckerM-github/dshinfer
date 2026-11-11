@@ -34,8 +34,8 @@ foreach ($procId in ($listeners.OwningProcess | Sort-Object -Unique)) {
     Write-Host "stopped service process $procId"
 }
 
-# The engine is a child of the service, but if the service was killed hard the
-# engine can survive and hold 5 GB of VRAM - kill by image name.
+# Legacy safety net: the engine now runs inside the service process, but a
+# llama-server left over from the old subprocess engine can still hold ~5 GB VRAM.
 $engines = Get-Process -Name 'llama-server' -ErrorAction SilentlyContinue
 foreach ($e in $engines) {
     & taskkill /PID $e.Id /T /F 2>&1 | Out-Null

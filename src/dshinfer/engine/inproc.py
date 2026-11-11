@@ -1,11 +1,11 @@
 """进程内 llama.cpp 引擎：用 ctypes 绑定直接调 `llama.dll`。
 
-和 `llamacpp_server.py` 的分工
-------------------------------
-    llamacpp_server.py   把 `llama-server.exe` 当子进程黑盒 —— 调度、KV 分配、
-                         多 slot 全是它的；我们只发 HTTP 收 token。
-    inproc.py            在同一个进程里调 libllama —— 省掉 HTTP 与进程间拷贝，
-                         KV / batch / 采样器全部可见。
+和"子进程 + HTTP"那种做法的分工
+--------------------------------
+    子进程 (llama-server)  把引擎当黑盒 —— 调度、KV 分配、多 slot 全是它的；
+                           服务层只发 HTTP 收 token。
+    inproc.py              在同一个进程里调 libllama —— 省掉 HTTP 与进程间拷贝，
+                           KV / batch / 采样器全部可见。
 
 收益与代价（都是实测得到的，不是理论）
 -------------------------------------

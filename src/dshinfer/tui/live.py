@@ -1,10 +1,10 @@
 """一次快照（Snapshot）：三路数据源拼成 UI 直接可读的扁平结构。
 
 为什么要有这一层：
-  · UI 每 2 秒要一次全部数据，三路（NVML / 系统 / 两个 Prometheus 端点）各有各的
+  · UI 每 2 秒要一次全部数据，三路（NVML / 系统 / 服务层 /metrics）各有各的
     超时与失败方式，视图层不该关心"哪一路挂了"；
-  · 引擎（llama-server /metrics）与服务层（dshinfer /metrics）的指标名不同但语义重复，
-    在这里统一成 rate / totals / slots / cache 几个字典；
+  · 引擎在服务进程内，所以只有一个 /metrics：在这里统一成 rate / totals / slots / cache
+    几个字典，视图层不用知道指标名；
   · 所有采集都降级：任何一路失败只记一句 errors，绝不抛异常——面板挂在屏幕上
     跑几个小时，不能因为一次 curl 超时整屏崩掉。
 """
@@ -245,7 +245,6 @@ class Snapshot:
     ts: float = 0.0
     model: str = ""
     ctx_limit: int = 0
-    engine_url: str = ""
     service_url: str = ""
     engine: str = ""
     backend: str = "none"
@@ -258,6 +257,8 @@ class Snapshot:
     rate: dict[str, float | None] = field(default_factory=dict)
     hist: dict[str, dict[str, float]] = field(default_factory=dict)
     traces: list[dict] = field(default_factory=list)
+    # 最近一批 trace 里最大的 (prompt + completion)，用来显示"当前最长的请求用了多少上下文"
+    ctx_used: float = 0.0
     health: dict = field(default_factory=dict)
     model_info: dict = field(default_factory=dict)
     tokens: dict[str, int] = field(default_factory=dict)
@@ -273,16 +274,13 @@ class Snapshot:
 
     @property
     def tok_s(self) -> float:
-        """主数字：优先 EWMA，其次引擎 gauge，再次计数器均值。"""
+        """主数字：优先 EWMA，没有就退回累计 token / 累计生成秒数。"""
         window = self.rate.get("window") or 0.0
         if window > 0:
             return window
-        gauge = self.engine_metrics.get("predicted_tokens_seconds") or 0.0
-        if gauge > 0:
-            return gauge
-        secs = self.engine_metrics.get("tokens_predicted_seconds_total")
-        total = self.engine_metrics.get("tokens_predicted_total")
-        if secs and total:
+        secs = self.totals.get("decode_seconds") or 0.0
+        total = self.totals.get("tokens_predicted") or 0.0
+        if secs > 0 and total > 0:
             return total / secs
         return 0.0
 
@@ -377,7 +375,6 @@ def load_model_info(gguf_path: str | Path | None) -> dict:
 
 def sample_snapshot(
     *,
-    engine_url: str,
     service_url: str,
     model: str,
     ctx_limit: int,
@@ -390,7 +387,6 @@ def sample_snapshot(
         ts=time.time(),
         model=model,
         ctx_limit=ctx_limit,
-        engine_url=engine_url,
         service_url=service_url,
         engine=engine,
         model_info=model_info or {},
@@ -411,13 +407,8 @@ def sample_snapshot(
     else:
         snap.hardware_error = "probe 模块未就绪（没有安装 tui 采集层）"
 
-    engine_metrics = parse_prom(fetch(engine_url)) if engine == "llamacpp" else {}
-    if engine == "llamacpp" and not engine_metrics:
-        snap.errors.append("引擎指标读不到（容器内 127.0.0.1:8124，检查引擎是否就绪）")
-    snap.engine_metrics = {
-        key.replace("llamacpp:", ""): value for key, value in engine_metrics.items()
-    }
-
+    # inproc 把引擎搬进了服务进程，所以"引擎指标"就是服务层指标：
+    # 不再有第二个 /metrics 端点，也不再区分 llamacpp: 前缀。
     snap.service_metrics = parse_prom(fetch(service_url.rstrip("/") + "/metrics"))
     if not snap.service_metrics:
         snap.errors.append("服务层指标读不到（/metrics）")
@@ -434,25 +425,33 @@ def sample_snapshot(
     else:
         snap.errors.append("/admin/traces 读不到（面板服务层可能不是本轮代码）")
 
-    engine_metrics = snap.engine_metrics
+    for item in snap.traces:
+        tokens = item.get("tokens") or {}
+        used = float(tokens.get("prompt") or 0) + float(tokens.get("completion") or 0)
+        snap.ctx_used = max(snap.ctx_used, used)
+
     for name, key in (("input", "input"), ("output", "output"), ("cached", "cached")):
         value = series(snap.service_metrics, "dshinfer_tokens_total", direction=key)
         snap.tokens[name] = int(value or 0)
 
+    decode_seconds = snap.service_metrics.get("dshinfer_decode_seconds_total") or 0.0
+    requests_done = series(snap.service_metrics, "dshinfer_requests_total") or 0.0
     snap.totals = {
-        "tokens_predicted": engine_metrics.get("tokens_predicted_total") or 0.0,
-        "prompt_tokens": engine_metrics.get("prompt_tokens_total") or 0.0,
-        "prompt_cached": engine_metrics.get("prompt_tokens_cached_total") or 0.0,
-        "n_decode": engine_metrics.get("n_decode_total") or 0.0,
-        "n_tokens_max": engine_metrics.get("n_tokens_max") or 0.0,
-        "spec_draft": engine_metrics.get("spec_decode_num_draft_tokens_total") or 0.0,
-        "spec_accepted": engine_metrics.get("spec_decode_num_accepted_tokens_total") or 0.0,
+        "tokens_predicted": float(snap.tokens["output"]),
+        "prompt_tokens": float(snap.tokens["input"]),
+        "prompt_cached": float(snap.tokens["cached"]),
+        "n_decode": requests_done,
+        "decode_seconds": decode_seconds,
+        "n_tokens_max": 0.0,
+        "spec_draft": 0.0,
+        "spec_accepted": 0.0,
     }
     snap.slots = {
-        "processing": engine_metrics.get("requests_processing") or 0.0,
-        "deferred": engine_metrics.get("requests_deferred") or 0.0,
-        "busy": engine_metrics.get("n_busy_slots_per_decode") or 0.0,
-        "parallel": engine_metrics.get("n_parallel") or 0.0,
+        "processing": snap.service_metrics.get("dshinfer_inflight_requests") or 0.0,
+        "deferred": snap.service_metrics.get("dshinfer_queue_depth") or 0.0,
+        "busy": 1.0 if (snap.service_metrics.get("dshinfer_inflight_requests") or 0.0) else 0.0,
+        # inproc 一个 context 一次只跑一个 decode，"序列数"恒 1
+        "parallel": 1.0,
     }
     prompt_total = snap.totals["prompt_tokens"]
     snap.cache = {
@@ -480,8 +479,8 @@ def sample_snapshot(
             snap.hist[name] = value
 
     snap.rate = engine_rate(
-        tokens=engine_metrics.get("tokens_predicted_total"),
-        secs=engine_metrics.get("tokens_predicted_seconds_total"),
+        tokens=snap.totals.get("tokens_predicted"),
+        secs=snap.totals.get("decode_seconds"),
         now=time.monotonic(),
     )
     return snap

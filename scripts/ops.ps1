@@ -33,7 +33,6 @@ $Base = "http://127.0.0.1:$Port"
 # Weights dir: same precedence as the service (env > Windows default), so check
 # inspects the directory the engine actually reads.
 $WeightsDir = if ($env:DSHINFER_MODELS_DIR) { $env:DSHINFER_MODELS_DIR } else { "D:\llm\models\gguf" }
-$EngineLog = Join-Path $RunDir 'llama-server.log'
 $ServiceLog = Join-Path $RunDir 'service.log'
 $WatchdogLog = Join-Path $RunDir 'watchdog.log'
 
@@ -83,18 +82,13 @@ function cmd_status {
     } else {
         Write-Host '  healthz    : no answer (service down?)'
     }
-    # engine process only exists for llamacpp; inproc runs inside the service process
-    $engName = if ($h) { [string]$h.engine.engine } else { '' }
-    $eng = Get-Process -Name 'llama-server' -ErrorAction SilentlyContinue
-    if ($engName -like '*inproc*') {
+    # the engine lives in the service process, so its cost is the service RSS
+    if ($h) {
         $svc = Get-Process -Id $pids -ErrorAction SilentlyContinue | Select-Object -First 1
         $mb = if ($svc) { [math]::Round($svc.WorkingSet64 / 1MB) } else { 0 }
         Write-Host ("  engine     : in-process (service pid {0} rss {1} MiB)" -f (($pids) -join ','), $mb)
-    } elseif ($eng) {
-        $mb = [math]::Round(($eng | Measure-Object -Property WorkingSet64 -Sum).Sum / 1MB)
-        Write-Host ("  engine     : llama-server pid {0} rss {1} MiB" -f (($eng | ForEach-Object { $_.Id }) -join ','), $mb)
     } else {
-        Write-Host '  engine     : llama-server not running'
+        Write-Host '  engine     : unknown (service not answering)'
     }
     $vram = Get-Vram
     if ($vram) { Write-Host ("  vram       : {0} / {1} MiB" -f $vram.Used, $vram.Total) } else { Write-Host '  vram       : nvidia-smi unavailable' }
@@ -159,7 +153,8 @@ function cmd_logs([string[]]$Args) {
         elseif ($a -in @('service', 'engine', 'watchdog')) { $which = $a }
     }
     $path = switch ($which) {
-        'engine' { $EngineLog }
+        # engine runs inside the service process: there is no separate engine log
+        'engine' { Write-Host '  engine is in-process; showing service.log'; $ServiceLog }
         'watchdog' { $WatchdogLog }
         default { $ServiceLog }
     }

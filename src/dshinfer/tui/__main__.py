@@ -33,7 +33,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--snapshot", action="store_true", help="打印一次 JSON 快照后退出")
     parser.add_argument("--dump-env", action="store_true", help="打印 compose 环境变量片段后退出")
     parser.add_argument("--local-env", action="store_true", help="--dump-env 时导出本机（非容器）路径")
-    parser.add_argument("--engine-url", help="引擎 /metrics 地址，默认 http://127.0.0.1:<engine_port>/metrics")
     parser.add_argument("--service-url", help="服务层地址，默认 http://<host>:<port>")
     parser.add_argument("--interval", type=float, default=2.0, help="刷新间隔秒（默认 2）")
     return parser
@@ -45,10 +44,6 @@ def _load_preset(args: argparse.Namespace) -> Preset:
     return Preset.latest()
 
 
-def _engine_url(args: argparse.Namespace, preset: Preset) -> str:
-    return args.engine_url or f"http://127.0.0.1:{preset.engine_port}/metrics"
-
-
 def _service_url(args: argparse.Namespace, preset: Preset) -> str:
     if args.service_url:
         return args.service_url
@@ -58,7 +53,6 @@ def _service_url(args: argparse.Namespace, preset: Preset) -> str:
 
 def _print_snapshot(args: argparse.Namespace, preset: Preset) -> int:
     snapshot = live.sample_snapshot(
-        engine_url=_engine_url(args, preset),
         service_url=_service_url(args, preset),
         model=preset.model_stem,
         ctx_limit=preset.n_ctx,
@@ -137,7 +131,6 @@ def main(argv: list[str] | None = None) -> int:
 
     monitor = MonitorApp(
         preset,
-        engine_url=_engine_url(args, preset),
         service_url=_service_url(args, preset),
         interval=args.interval,
     )

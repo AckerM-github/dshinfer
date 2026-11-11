@@ -22,6 +22,11 @@ REQUESTS = Counter(
 TOKENS = Counter(
     "dshinfer_tokens_total", "令牌总数", ["direction"], registry=REGISTRY
 )
+# 引擎自报的生成耗时累计。TUI 用它算"单条 decode 的真实速度"（等价 llama-bench 的 tg），
+# 比 Δtoken/Δ墙钟 干净：不含 SSE 编码、网络和排队。
+DECODE_SECONDS = Counter(
+    "dshinfer_decode_seconds_total", "累计生成耗时（秒）", registry=REGISTRY
+)
 TTFT = Histogram(
     "dshinfer_ttft_seconds",
     "首字延迟",

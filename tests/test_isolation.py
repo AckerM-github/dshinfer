@@ -33,13 +33,10 @@ TUNING_KEYS = [
     "DSHINFER_CACHE_TYPE_V",
     "DSHINFER_N_PARALLEL",
     "DSHINFER_MAX_CONCURRENCY",
-    "DSHINFER_KV_UNIFIED",
     "DSHINFER_N_BATCH",
     "DSHINFER_N_UBATCH",
     "DSHINFER_FLASH_ATTN",
-    "DSHINFER_SLOT_PINNING",
     "DSHINFER_N_GPU_LAYERS",
-    "DSHINFER_FIT",
     "DSHINFER_ENABLE_THINKING",
 ]
 
@@ -153,11 +150,8 @@ def test_settings_defaults_follow_platform():
     s = Settings(engine="mock", log_level="error", _env_file=None)
     if os.name == "nt":
         assert s.models_dir.startswith("D:")
-        assert s.llama_server_path.endswith("llama-server.exe")
     else:
         assert not s.models_dir.startswith("D:")
-        assert not s.llama_server_path.endswith(".exe")
-        assert s.llama_server_path.startswith("/")
 
 
 def test_verify_env_is_stdlib_only():

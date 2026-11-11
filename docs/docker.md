@@ -699,31 +699,96 @@ NVIDIA 的 apt 仓库按架构分目录（`stable/deb/amd64`），与发行版 c
 去掉所有手工挂载后的实测：`ops.sh up` **12 s** 就绪、32K 显存 **6,001 MiB**、`ops.sh check` **7/7 通过**；
 64K（只用基础 compose，不带覆盖层）短 prompt **34–35 t/s**、显存 **6,737 MiB**、容器内 `nvidia-smi` 可用（运行时注入）。
 
-## 17. 引擎选择：原生默认 `inproc`，容器强制 `llamacpp`（2026-11-11）
+## 17. 引擎形态：容器里也跑 inproc（2026-11-11 二次改造）
 
-起因：Windows 侧新增了进程内引擎（`vendor/llama_cpp` → `llama.dll`），并把 `config/base.env` 的默认值改成 `inproc`。
-容器里跑不了它，所以 `config/docker.env` 显式覆盖回 `llamacpp`。
+**先读这段**：第 1–16 节记录的是 2026-11-11 之前那版「llama-server 子进程」的容器化过程，
+`/opt/llama`、`LD_LIBRARY_PATH`、`-np 4`、槽位这些概念都属于那一版；`llamacpp_server.py` 已删除。
+现役形态见本节。
+
+### 17.1 为什么必须改
+
+删掉 `engine/llamacpp_server.py` 之后，`/opt/llama/bin/llama-server` 在容器里没有任何人拉起，
+镜像里却还躺着一份 1.7 GB 的 llama.cpp 二进制与 `libggml-cuda.so`，等于养两套引擎、两套参数、
+两套日志。要么容器降回 `llamacpp`（就得把删掉的适配器留着），要么让容器也用进程内绑定。
+
+### 17.2 关键发现：官方发布 manylinux wheel
+
+llama-cpp-python 的 GitHub release 里，与 Windows 的 `py3-none-win_amd64.whl` 并列，
+还有一份 **Linux** 的：
+
+```text
+https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.36-cu124/
+    llama_cpp_python-0.3.36-py3-none-manylinux_2_35_x86_64.whl      # 1.78 GB
+```
+
+`py3-none` 意味着里面没有 Python C 扩展，只有 Python 代码 + **预编译好的 CUDA 版 `libllama.so`
+/ `libggml.so` / `libggml-base.so` / `libggml-cpu.so` / `libggml-cuda.so`**。
+所以容器里既不需要 `nvcc`，也不需要 CUDA Toolkit —— 这与 Windows 侧“装个 wheel 就能用 GPU”
+是同一件事，只是平台不同。
 
 | 项 | 原生（Windows） | 容器（Linux） |
 |---|---|---|
-| 默认引擎 | `inproc`（`base.env`） | `llamacpp`（`docker.env` 覆盖，后读到的赢） |
-| 为什么 | 进程内省 20–30 ms；单人对话够用 | 镜像里没有 `vendor/`，也没有 Linux 版 `libllama.so`；`/opt/llama/bin/llama-server` 才是可用路径 |
-| 并发 | **1**（一个 context 一次只能一个 decode） | 4 slot + `kv_unified` |
-| 实测 | 首字 0.9 s、~41.5 tok/s、重复前缀 `cached=18/19` | 非流式 1.50 s、流式 42 帧、32K/4 slot |
+| 引擎 | `inproc` | `inproc` |
+| 引擎二进制 | `D:\llm\runtime\llama-inproc\bin\*.dll`（10 个 / 1.59 GB） | wheel 自带的 `*.so`（同一版本 0.3.36 / cu124） |
+| 绑定代码 | `vendor/llama_cpp`（15 个 .py / 16,910 行） | 同一个 wheel 里的 `llama_cpp` 包 |
+| 谁提供 | `.env` 的 `DSHINFER_INPROC_LIB_DIR` | Dockerfile `ENV` |
+| 并发 | **1** | **1** |
+| CUDA 来自 | 系统驱动 610.60 + `llama-inproc\bin` 里的 cublas/cudart | `nvidia/cuda:12.8.0-runtime` 里的 `libcublas` / `libcudart` |
 
-容器内强开 `DSHINFER_ENGINE=inproc` 的实测报错（取证用）：
+### 17.3 镜像结构（现役）
 
-```text
-EngineError: import llama_cpp 失败：需要 vendor/llama_cpp 或 pip install llama-cpp-python
+```dockerfile
+ARG UBUNTU_BASE=ubuntu:24.04
+ARG CUDA_BASE=nvidia/cuda:12.8.0-runtime-ubuntu24.04   # 注意：runtime 不是 devel
+
+FROM ${UBUNTU_BASE} AS wheel        # 只负责把 src/ 打成 wheel（hatchling 不进运行时）
+FROM ${CUDA_BASE}                  # 运行时：python3 + /opt/venv + manylinux wheel
 ```
 
-要让容器也用进程内引擎，需要三件事一起做（目前没做）：
+三个要点：
 
-1. 镜像里 `COPY vendor/ /app/vendor/`，并把 `/app` 加进 `PYTHONPATH`；
-2. 用与 vendor 绑定同源的 llama.cpp（`7d7f0287`）编出 Linux 版 `libllama.so`，放进 `/opt/llama/lib`；
-3. `docker.env` 设 `DSHINFER_INPROC_LIB_DIR=/opt/llama/lib` 并删掉 `DSHINFER_ENGINE=llamacpp` 这行。
+1. **两个 ARG 必须在第一个 `FROM` 之前**。写在阶段之间的话，后面的 `FROM ${CUDA_BASE}`
+   拿到空值，报 `failed to solve: base name (${CUDA_BASE}) should not be blank`（本节第一次构建就踩了）。
+2. `pip install --no-deps <wheel-url>` —— 依赖不跟着走，由 `docker/requirements.lock` 按
+   `--require-hashes` 装（新增了 `numpy==2.5.4`、`diskcache==5.6.3`，这两个是 llama-cpp-python 的运行时依赖）。
+3. 构建期自检：`llama_cpp.__version__ == 0.3.36`，且包里 `lib/` 下必须有 `libllama.so*` 与
+   `*ggml-cuda*`。缺一个就 fail fast，不要等到运行时才发现“没有 GPU 后端”。
 
-风险：第 2 步的 `.so` 版本必须和 vendor 的 `llama.h` 对得上，否则就是 Windows 侧踩过的
-`no backends are loaded` / `access violation`（见 `docs/models.md` §6 与本节 16.3）。
+### 17.4 和上一版的对照
 
+| 维度 | 上一版（llama-server 子进程） | 现役（进程内） |
+|---|---|---|
+| 镜像里的引擎 | `/opt/llama/bin/llama-server` + 7 个 .so | wheel 自带 `.so` |
+| 进程数 | 2（服务 + 引擎） | 1 |
+| 并发 | 4 slot + `kv_unified` | 1 |
+| 每请求开销 | 多 20–30 ms（HTTP over loopback） | 无 |
+| 崩溃隔离 | 有（引擎挂了服务还在） | 无（C 层崩 = 整个容器退出，靠 compose `restart`） |
+| 参数来源 | `-c/-ctk/-ctv/-np` 命令行 | `Llama(...)` 构造参数（`config/base.env`） |
+| 指标 | 两个 `/metrics`（服务层 + `llamacpp:` 前缀的引擎） | 一个 `/metrics` |
 
+### 17.5 验证清单
+
+```bash
+docker compose -f docker/compose.yaml -f docker/compose.wsl.yaml up -d --build
+docker compose -f docker/compose.yaml -f docker/compose.wsl.yaml exec infer \
+  curl -s http://127.0.0.1:8000/healthz        # engine 必须是 llama.cpp-inproc
+docker compose -f docker/compose.yaml -f docker/compose.wsl.yaml exec infer \
+  curl -s http://127.0.0.1:8000/metrics | grep dshinfer_decode_seconds_total
+docker stats --no-stream dshinfer               # 显存应 ≥ 6 GB（权重 5.24 GB 全在 GPU 上）
+```
+
+实测（2026-11-11 23:59，WSL2 Ubuntu 26.04 / RTX 4060 8 GB）：
+
+| 项 | 值 |
+|---|---|
+| `/healthz` | `engine=llama.cpp-inproc`、`ready=true`、`load_seconds=16.34`、`n_ctx=32768`、`concurrency=1` |
+| `/admin/config` | `n_parallel=1`、`max_concurrency=1`、`cache_type_k/v=q8_0`、`n_gpu_layers=-1` |
+| 非流式 | 40 token / 1.72 s（含 20 token prompt），中文正常 |
+| 流式 | 42 帧 / 1.06 s |
+| 显存 | 6,525 MiB / 8,188 MiB |
+| 进程 | 容器内只有 `tini`(1) + `python`(7)，RSS 1.2 GB（显存另计） |
+
+一个必须知道的坑：`MODELS_DIR` 指向的是 **WSL ext4 里的副本**（`/home/linc/models`），
+不是 Windows 侧 `D:\llm\models\gguf`。修好 GGUF 头部后忘了同步 ext4，容器会报
+`ValueError: Failed to load model from file: /models/...gguf`——因为那边还是旧的 33 层元数据。
+同步一次 49 s（`cp` 走 9p），之后只在换模型时需要。

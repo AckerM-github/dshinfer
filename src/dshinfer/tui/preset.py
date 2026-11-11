@@ -10,7 +10,7 @@
     ~/.config/dshinfer/presets/<name>.env     docker compose 可直接用的环境变量片段
 
 本机（Windows 原生跑）用 to_env(container=False) 得到 D: 路径版本；容器里跑
-用 to_env(container=True) 得到 /models、/opt/llama/bin/llama-server 版本。
+用 to_env(container=True) 得到 /models 与镜像内固定路径版本。
 """
 
 from __future__ import annotations
@@ -21,16 +21,13 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 DEFAULT_MODELS_DIR_WIN = r"D:\llm\models\gguf"
-DEFAULT_SERVER_WIN = r"D:\llm\runtime\llama.cpp\llama-server.exe"
-DEFAULT_LOG_WIN = r"D:\llm\runtime\llama-server.log"
+DEFAULT_LOG_WIN = r"D:\llm\runtime\service.log"
 DEFAULT_MODELS_DIR_POSIX = "~/models"
-DEFAULT_SERVER_POSIX = "/opt/llama/bin/llama-server"
-DEFAULT_LOG_POSIX = "/var/log/dshinfer/llama-server.log"
+DEFAULT_LOG_POSIX = "/var/log/dshinfer/service.log"
 
 # 容器里这些路径是 Dockerfile / compose 约定好的，不要改
 CONTAINER_MODELS_DIR = "/models"
-CONTAINER_SERVER_PATH = "/opt/llama/bin/llama-server"
-CONTAINER_LOG_PATH = "/var/log/dshinfer/llama-server.log"
+CONTAINER_LOG_PATH = "/var/log/dshinfer/service.log"
 CONTAINER_CHAT_TEMPLATE = "/app/runtime/chat_template.jinja"
 
 
@@ -50,11 +47,10 @@ def presets_dir() -> Path:
 def in_container() -> bool:
     """是不是跑在镜像里（而不是宿主机原生跑）。
 
-    判据用两个"只有镜像里才同时成立"的事实：/models 是 compose 的挂载点，
-    /opt/llama/bin/llama-server 是 Dockerfile 摊平后的引擎。宿主机的 WSL 里
-    ~/models 存在但 /models 不一定存在，所以两个同时成立才算。
+    判据用 /.dockerenv：这是 Docker 给每个容器放的空文件，宿主机上不存在；
+    比"某个路径在不在"更稳（/models 是挂载点，宿主机的 WSL 里也可能有同名目录）。
     """
-    return Path(CONTAINER_MODELS_DIR).is_dir() and Path(CONTAINER_SERVER_PATH).exists()
+    return Path("/.dockerenv").exists()
 
 
 def default_models_dir() -> str:
@@ -63,14 +59,6 @@ def default_models_dir() -> str:
     if in_container():
         return CONTAINER_MODELS_DIR
     return DEFAULT_MODELS_DIR_POSIX
-
-
-def default_server_path() -> str:
-    if os.name == "nt":
-        return DEFAULT_SERVER_WIN
-    if in_container():
-        return CONTAINER_SERVER_PATH
-    return DEFAULT_SERVER_POSIX
 
 
 def default_log_path() -> str:
@@ -112,23 +100,21 @@ class Preset:
     name: str = "default"
     model_file: str = ""
     models_dir: str = ""
-    # 上下文与 KV 量化：8 GB 显存下这两个是一对（32K/q8_0 = 40 t/s、64K/q8_0 = 26 t/s）
+    # 上下文与 KV 量化：8 GB 显存下这两个是一对（32K/q8_0 = 41 t/s、64K/q8_0 = 26 t/s）
     n_ctx: int = 32768
     cache_type_k: str = "q8_0"
     cache_type_v: str = "q8_0"
     # 多模态投影文件，空字符串 = 不支持图片输入
     mmproj: str = ""
-    n_parallel: int = 4
-    max_concurrency: int = 4
+    # inproc 引擎一个 context 一次只跑一个 decode，所以序列数 = 1、并发 = 1
+    n_parallel: int = 1
+    max_concurrency: int = 1
     n_batch: int = 2048
     n_ubatch: int = 1024
     flash_attn: bool = True
-    kv_unified: bool = True
     n_gpu_layers: int = -1
-    engine: str = "llamacpp"
-    llama_server_path: str = ""
-    engine_port: int = 8124
-    engine_log_path: str = ""
+    engine: str = "inproc"
+    service_log_path: str = ""
     host: str = "127.0.0.1"
     port: int = 8000
 
@@ -139,8 +125,7 @@ class Preset:
         preset = cls(
             name=name,
             models_dir=default_models_dir(),
-            llama_server_path=default_server_path(),
-            engine_log_path=default_log_path(),
+            service_log_path=default_log_path(),
         )
         candidates = discover_models(preset.models_dir)
         if candidates:
@@ -178,7 +163,7 @@ class Preset:
             issues.append("并发必须 >= 1")
         if self.max_concurrency > self.n_parallel:
             issues.append(
-                f"服务层并发 {self.max_concurrency} 大于引擎 slot 数 {self.n_parallel}，"
+                f"服务层并发 {self.max_concurrency} 大于引擎序列数 {self.n_parallel}，"
                 "多出来的请求会一直排队"
             )
         if self.n_batch < self.n_ubatch:
@@ -192,8 +177,10 @@ class Preset:
                 f"上下文 {self.n_ctx:,} 超过 32K：本机这是常规档位的上限，"
                 "64K 生成速度会掉约 35%（40 → 26 t/s）"
             )
-        if self.n_parallel > 4:
-            out.append("slot 超过 4 在本机只会加排队开销（8 GB 显存也放不下更多 KV）")
+        if self.n_parallel > 1:
+            out.append(
+                "inproc 引擎一个 context 一次只跑一个 decode，序列数 >1 只会多占 KV，不会更快"
+            )
         if self.cache_type_k == "f16" and self.n_ctx > 32768:
             out.append("上下文 >32K 还用 f16 KV 很可能直接 OOM，建议 q8_0")
         if not self.flash_attn:
@@ -241,25 +228,23 @@ class Preset:
     # ------------------------------------------------------------ 导出环境变量
 
     def to_env(self, container: bool = True) -> list[tuple[str, str]]:
-        """按 compose / Dockerfile 的键名导出，顺序固定（方便 diff 与贴进 yaml）。"""
+        """按 compose / Dockerfile 的键名导出，顺序固定（方便 diff 与贴进 yaml）。
+
+        只导出 Settings 里真的存在的键：inproc 把引擎搬进了服务进程，
+        LLAMA_SERVER_PATH / ENGINE_LOG_PATH / KV_UNIFIED 这些已经不存在了。
+        """
         if container:
             models_dir = CONTAINER_MODELS_DIR
             gguf = f"{CONTAINER_MODELS_DIR}/{Path(self.model_file).name}"
-            server = CONTAINER_SERVER_PATH
-            log = CONTAINER_LOG_PATH
             host = "0.0.0.0"
         else:
             models_dir = self.models_dir
             gguf = self.gguf_path
-            server = self.llama_server_path
-            log = self.engine_log_path
             host = self.host
         pairs: list[tuple[str, str]] = [
             ("DSHINFER_ENGINE", self.engine),
             ("DSHINFER_MODELS_DIR", models_dir),
             ("DSHINFER_GGUF_PATH", gguf),
-            ("DSHINFER_LLAMA_SERVER_PATH", server),
-            ("DSHINFER_ENGINE_LOG_PATH", log),
             ("DSHINFER_HOST", host),
             ("DSHINFER_PORT", str(self.port)),
             ("DSHINFER_N_CTX", str(self.n_ctx)),
@@ -267,7 +252,6 @@ class Preset:
             ("DSHINFER_CACHE_TYPE_V", self.cache_type_v),
             ("DSHINFER_N_PARALLEL", str(self.n_parallel)),
             ("DSHINFER_MAX_CONCURRENCY", str(self.max_concurrency)),
-            ("DSHINFER_KV_UNIFIED", _bool(self.kv_unified)),
             ("DSHINFER_N_BATCH", str(self.n_batch)),
             ("DSHINFER_N_UBATCH", str(self.n_ubatch)),
             ("DSHINFER_FLASH_ATTN", _bool(self.flash_attn)),

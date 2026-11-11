@@ -13,8 +13,8 @@
 #   restart         重启
 #   status          容器、/healthz、显存、磁盘占用总览
 #   check           7 项体检：(docker/容器/healthz/API/权重/显存/磁盘)，全通过 exit 0
-#   logs [N] [-e] [-f]   服务日志（-e 引擎日志，-f 跟随）
-#   bench [args]    停服务 → 一次性容器跑 llama-bench → 自动拉起服务
+#   logs [N] [-f]   服务日志（-f 跟随；引擎在进程内，只有这一个日志源）
+#   bench [N]       对服务发一次固定请求，报 prompt / decode 速度
 #   models          打印权重清单并校验目标目录里的文件
 #   shell           进入容器 bash
 #   verify          两端一致性自检（容器 vs 宿主 /admin/config）
@@ -140,7 +140,7 @@ cmd_status() {
   if [ -n "$smi" ]; then
     $smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader | sed 's/^/  /'
   else
-    warn "宿主找不到 nvidia-smi（容器内的 llama-server 仍在用 GPU，不影响）"
+    warn "宿主找不到 nvidia-smi（容器内的服务进程仍在用 GPU，不影响）"
   fi
 
   head1 "资源 / 磁盘"
@@ -278,81 +278,70 @@ if e.get("last_error"):
 # ---------------------------------------------------------------- logs
 
 cmd_logs() {
-  local n=50 engine=0 follow=0 a
+  local n=50 follow=0 a
   for a in "$@"; do
     case "$a" in
-      -e|--engine) engine=1 ;;
+      -e|--engine)
+        warn "-e 已无意义：引擎在服务进程内，引擎日志就是服务日志"
+        ;;
       -f|--follow) follow=1 ;;
       *) n=$a ;;
     esac
   done
-  if [ "$engine" = 1 ]; then
-    head1 "引擎日志 /var/log/dshinfer/llama-server.log（最后 $n 行）"
-    if [ "$follow" = 1 ]; then d exec "$CONTAINER" tail -f -n "$n" /var/log/dshinfer/llama-server.log
-    else d exec "$CONTAINER" tail -n "$n" /var/log/dshinfer/llama-server.log; fi
-  else
-    head1 "服务日志（最后 $n 行）"
-    if [ "$follow" = 1 ]; then dc logs -f --tail "$n"; else dc logs --tail "$n" --no-log-prefix 2>&1 | tail -n "$n"; fi
-  fi
+  head1 "服务日志（最后 $n 行）"
+  if [ "$follow" = 1 ]; then dc logs -f --tail "$n"; else dc logs --tail "$n" --no-log-prefix 2>&1 | tail -n "$n"; fi
 }
 
 # ---------------------------------------------------------------- bench
 
-# 必须在顶层定义、用全局变量：EXIT trap 触发时 cmd_bench 的 local 已经消失
-BENCH_WAS_UP=0
-BENCH_STAY_DOWN=0
-BENCH_RESTARTED=0
-bench_restore() {
-  if [ "${BENCH_WAS_UP:-0}" = 1 ] && [ "${BENCH_STAY_DOWN:-0}" = 0 ] && [ "${BENCH_RESTARTED:-0}" = 0 ]; then
-    BENCH_RESTARTED=1
-    echo "  重新拉起服务..."
-    dc up -d >/dev/null
-    local t0=$SECONDS
-    while [ $((SECONDS - t0)) -lt 120 ]; do
-      if curl -fsS --max-time 3 "$HTTP/healthz" >/dev/null 2>&1; then
-        echo "  已就绪，用时 $((SECONDS - t0)) s"
-        return 0
-      fi
-      sleep 2
-    done
-    echo "  容器起来了但 120 s 内未就绪，看日志：bash docker/ops.sh logs 80"
-  fi
-}
-
+# 引擎在进程内，镜像里没有 llama-bench 可调；改成对服务本身发一次固定请求，
+# 用响应里的 usage 和墙钟时间算等价于 llama-bench 的 pp / tg。
 cmd_bench() {
-  local stay_down=0 a
-  local args=()
-  for a in "$@"; do
-    case "$a" in
-      --stay-down) stay_down=1 ;;
-      *) args+=("$a") ;;
-    esac
-  done
-  [ "${#args[@]}" -eq 0 ] && args=(-p 512 -n 128 -ngl 99 -fa 1)
+  local max_tokens="${1:-128}"
+  is_up || die "容器 $CONTAINER 没在跑：先 bash docker/ops.sh up"
+  head1 "对服务发一次请求（max_tokens=$max_tokens，固定 prompt）"
+  d exec -i "$CONTAINER" /opt/venv/bin/python - "$max_tokens" <<'PY'
+import json
+import sys
+import time
+import urllib.request
 
-  d image inspect "$IMAGE" >/dev/null 2>&1 || die "镜像 $IMAGE 不存在，先跑 bash docker/ops.sh up --build"
+max_tokens = int(sys.argv[1])
+prompt = (
+    "Explain in detail how a transformer decodes one token: attention, "
+    "KV cache, logits, sampling. Write at least 300 words."
+)
+body = json.dumps(
+    {
+        "model": "local",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+    }
+).encode()
 
-  BENCH_WAS_UP=0
-  BENCH_STAY_DOWN=$stay_down
-  BENCH_RESTARTED=0
-  is_up && BENCH_WAS_UP=1
 
-  if [ "$BENCH_WAS_UP" = 1 ]; then
-    head1 "先停服务释放显存"
-    dc stop
-  fi
+def call():
+    req = urllib.request.Request(
+        "http://127.0.0.1:8000/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    t0 = time.perf_counter()
+    with urllib.request.urlopen(req, timeout=900) as resp:
+        data = json.loads(resp.read())
+    return data, time.perf_counter() - t0
 
-  trap bench_restore EXIT
 
-  # 2026-11-10 起 WSL 与云同一套：装了 nvidia-container-toolkit，一律 --gpus all
-  local gpu_opts=(--gpus all)
-
-  head1 "llama-bench $BENCH_MODEL ${args[*]}"
-  local rc=0
-  d run --rm -v "$MODELS_DIR:/models:ro" "${gpu_opts[@]}" "$IMAGE" \
-    /opt/llama/bin/llama-bench -m "$BENCH_MODEL" "${args[@]}" || rc=$?
-  bench_restore
-  return "$rc"
+call()  # 预热：第一发要触发加载 / 建 context
+data, wall = call()
+usage = data.get("usage", {})
+p = usage.get("prompt_tokens", 0)
+c = usage.get("completion_tokens", 0)
+details = usage.get("prompt_tokens_details") or {}
+print(f"  prompt {p} token（命中缓存 {details.get('cached_tokens', 0)}）")
+print(f"  decode {c} token / {wall:.2f} s = {c / wall:.2f} tok/s（含 HTTP 开销）")
+PY
 }
 
 # ---------------------------------------------------------------- models

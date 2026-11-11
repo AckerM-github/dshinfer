@@ -24,7 +24,7 @@ import structlog
 
 from .config import Settings
 from .engine import Engine, GenRequest, TokenEvent
-from .metrics import INFLIGHT, LATENCY, REQUESTS, TOKENS, TTFT
+from .metrics import DECODE_SECONDS, INFLIGHT, LATENCY, REQUESTS, TOKENS, TTFT
 from .scheduler import Grant, QueueFull, Scheduler
 from .schemas import ChatCompletionRequest
 from .toolcall import parse_tool_calls
@@ -324,7 +324,6 @@ class ChatService:
             top_p=prep.top_p,
             stop=prep.stop,
             seed=prep.seed,
-            slot=grant.slot if self.s.slot_pinning else None,
         )
 
         tool_mode = bool(prep.tools)
@@ -505,6 +504,8 @@ class ChatService:
             if usage is not None:
                 TOKENS.labels(direction="input").inc(usage.prompt_tokens)
                 TOKENS.labels(direction="cached").inc(usage.cached_tokens)
+                if usage.decode_ms > 0:
+                    DECODE_SECONDS.inc(usage.decode_ms / 1000.0)
             REQUESTS.labels(endpoint="chat", status=status, stream="true").inc()
             self._release(grant)
             if tr is not None:

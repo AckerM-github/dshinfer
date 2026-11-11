@@ -1,13 +1,13 @@
 # 文件清单（D:\llm\infer）
 
 统计口径：不含 `.venv`、`__pycache__`、`.pytest_cache`、`eval/results`。
-手写文件 **92 个 / 16,471 行**（`uv.lock` 1,081 行、`eval/latest.json` 403 行不入手写量）。
+手写文件 **91 个 / 16,430 行**（`uv.lock` 1,081 行、`eval/latest.json` 403 行不入手写量；删掉 `engine/llamacpp_server.py` 231 行）。
 
 ---
 
-## 一、服务层源码 `src/dshinfer/`（28 文件 / 6,829 行）
+## 一、服务层源码 `src/dshinfer/`（27 文件 / 6,376 行）
 
-三组：核心服务层（13 个）、引擎适配层（6 个）、终端面板 `tui/`（9 个，只在 `--extra tui` 时装）。
+三组：核心服务层（13 个）、引擎适配层（5 个：`base`/`mock`/`inproc`/`manager`/`__init__`）、终端面板 `tui/`（9 个，只在 `--extra tui` 时装）。
 另有 `vendor/llama_cpp/`（15 文件 / 16,910 行，进程内引擎用的第三方拷贝，来源与规矩见 `vendor/README.md`）。
 
 | 文件 | 行 | 职责 | 状态 |
@@ -25,10 +25,9 @@
 | `main.py` | 23 | uvicorn 启动入口 | 完成 |
 | `registry.py` | 146 | 模型注册表：扫目录、缓存、默认模型、热发现 | 完成 |
 | `gguf.py` | 199 | GGUF 头解析（架构/层数/上下文/维度/MoE），自写以便不依赖 llama.cpp | 完成 |
-| `engine/__init__.py` | 32 | `build_engine()` 工厂（mock / inproc / llama-server） | 完成 |
+| `engine/__init__.py` | 28 | `build_engine()` 工厂（mock / inproc） | 完成 |
 | `engine/base.py` | 59 | `Engine` 协议 + `GenRequest`/`TokenEvent`/`Usage` | 完成 |
-| `engine/llamacpp_server.py` | 231 | 子进程生命周期、启动参数（含 `-fit off`）、`/completion` 流解析、孤儿进程清理、`timings` 回读 | 完成 |
-| `engine/inproc.py` | 268 | 进程内引擎：`vendor/llama_cpp` → `llama.dll`；`threading.Lock` 串成并发 1、`create_completion(stream=True)`、前缀复用与 `cached_tokens` 自算 | 完成，默认引擎 |
+| `engine/inproc.py` | 268 | 进程内引擎：`vendor/llama_cpp` → `llama.dll`；`threading.Lock` 串成并发 1、`create_completion(stream=True)`、`cached_tokens` 自算（`tokenize(..., special=True)` 是硬要求） | 完成，唯一真引擎 |
 | `engine/manager.py` | 136 | 模型状态机 idle→loading→ready、互斥加载、热切换 | 完成 |
 | `engine/mock.py` | 79 | 假引擎（无模型也能跑通全链路） | 完成 |
 | `tui/__init__.py` | 25 | 面板模块分工与导出 | 完成 |
@@ -70,7 +69,7 @@
 | `verify_env.py` | 147 | 采 `/admin/config` 或本地服务，按 17 个契约键比对两形态是否一致（`--compare`，退出码 0/1/2） |
 | `supervise.ps1` | 124 | 看护进程：健康检查、失败阈值、重启、日志轮转、`stop.flag` |
 | `start.ps1` | 44 | 拉起看护（防双开，等待 `/healthz` 就绪） |
-| `stop.ps1` | 46 | 优雅停 → `taskkill /T` → 清端口与 llama-server 孤儿 |
+| `stop.ps1` | 46 | 优雅停 → `taskkill /T` → 清端口（并兜底清遗留的 llama-server 孤儿） |
 | `fetch-model.sh` | 189 | 按 `models/models.json` 下载权重：断点续传 + sha256 校验（退出码 0/2/3/4/5/6） |
 | `wsl-deploy.sh` | 162 | WSL 侧部署：clone/pull（默认 GitHub HTTPS）→ `ops.sh up --build` |
 | `bench_load.py` | 211 | 四档并发压测，服务 vs 直连引擎对照（`--service/--engine/--levels`） |
@@ -100,7 +99,7 @@
 | `docker/requirements.lock` | 721 | `uv export --frozen` 生成、带哈希的依赖清单（镜像里 `pip --require-hashes` 安装） |
 | `docker/chat_template.jinja` | 172 | 聊天模板（镜像里自带一份，避免依赖权重目录） |
 | `config/base.env` | 48 | **调优唯一来源**：上下文/KV/并发/批大小/FA/FIT…，零绝对路径 |
-| `config/docker.env` | 16 | 容器专属路径：`/models`、`/opt/llama/bin/llama-server`、`/var/log/dshinfer/...` |
+| `config/docker.env` | 15 | 容器专属路径：`/models`、`/app/runtime`、`/var/log/dshinfer/...` |
 
 ## 五、评测 `eval/`（3 手写文件 / 377 行 + 跑批产物）
 
@@ -117,7 +116,7 @@
 | 文件 | 行 | 内容 |
 |---|---:|---|
 | `perf.md` | 390 | 性能主报告：roofline、参数扫描、批处理、投机解码、量化、KV 统一池、前缀缓存、容器内复测、深度 vs 容量（`--fit` 真凶） |
-| `docker.md` | 701 | 容器化全流程：分层、WSL2 + toolkit、显存预算、`ops.sh`、源码进 WSL、依赖锁定、构建验证记录 |
+| `docker.md` | 794 | 容器化全流程：分层、WSL2 + toolkit、显存预算、`ops.sh`、源码进 WSL、依赖锁定、构建验证记录；§17 换成 inproc 形态（manylinux wheel、两阶段镜像、实测数据） |
 | `deploy.md` | 219 | **两形态部署契约**：三形态对照、配置单源与优先级、ops 命令对照、`verify_env.py`、清白性验证、上云清单、守卫测试 |
 | `tui.md` | 276 | 终端面板：向导 10 步、7 视图、数据来源与降级、三主题、容器内跑法、P0 改造记录 |
 | `bench.md` | 108 | 服务 vs 引擎四档压测、42% 反例、天花板分析、与 vLLM 定性对照 |
@@ -140,7 +139,7 @@
 协议、流式、工具、usage、错误码、调度、观测、模型管理、看护、评测、trace、容器化、双形态一致性都有且被测过。
 
 **推理层（第 2 层）：不是我们写的。**
-`llama.cpp` 提供算子和 KV 管理，我们只暴露参数面（`n_ctx`/`n_parallel`/`kv_unified`/`flash_attn`/`n_batch`/`n_ubatch`/`cache_reuse`/`fit`）。
+`llama.cpp` 提供算子和 KV 管理，我们只暴露参数面（`n_ctx`/`n_batch`/`n_ubatch`/`flash_attn`/`cache_type_k`/`cache_type_v`/`n_gpu_layers`）。
 这是有意的分工，不是未完成项——要在这一层"完善"，等价于重写 vLLM。
 
 **明确没做的**：鉴权/限流（面板与接口都无 key）、多租户隔离、CI、多卡调度、分布式、视觉塔与 MTP 头。

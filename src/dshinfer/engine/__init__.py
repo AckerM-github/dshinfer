@@ -21,10 +21,6 @@ def build_engine(settings: Settings, gguf_path: str | None = None) -> Engine:
     """按配置选择后端。gguf_path 由 EngineManager 在切换模型时传入。"""
     if settings.engine == "mock":
         return MockEngine(settings)
-    if settings.engine in ("llamacpp", "llama-server"):
-        from .llamacpp_server import LlamaServerEngine
-
-        return LlamaServerEngine(settings, gguf_path=gguf_path)
     if settings.engine in ("inproc", "llama.cpp-inproc"):
         from .inproc import InprocEngine
 

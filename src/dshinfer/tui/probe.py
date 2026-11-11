@@ -1,4 +1,4 @@
-"""终端面板的数据层：跨平台硬件（NVML / /proc / Win32）+ 引擎与服务指标。
+"""终端面板的数据层：跨平台硬件（NVML / /proc / Win32）+ 服务指标。
 
 为什么单独一层：Textual 只该负责画。所有「可能没有、可能很慢、可能报错」的采集
 都收在这里，并统一按「拿不到就降级」处理——硬件缺项置 None，HTTP 抓不到返回
@@ -11,9 +11,8 @@ None / 空 dict，sample_hardware() 整个函数不抛异常。这样 UI 的渲�
 2. CPU / 内存：Linux 读 /proc/stat（两次采样差分，模块级保存上一次）、
    /proc/loadavg、/proc/cpuinfo、/proc/meminfo；Windows 走 GetSystemTimes +
    NtQuerySystemInformation（逐核）+ GlobalMemoryStatusEx。
-3. 指标：llama-server 的 /metrics（名字带 llamacpp: 前缀，不是合法 Prometheus
-   命名，只能按文本解析）、服务层 /metrics（标准直方图桶），以及按累计计数器
-   差分出来的 tok/s。
+3. 指标：服务层 /metrics（标准直方图桶 + 累计计数器），以及按累计计数器
+   差分出来的 tok/s。引擎在进程内，不再有独立的 /metrics 端点。
 
 约定（跨平台、可降级）：
 - 纯标准库：不 import textual，也不 import 任何三方包；
@@ -39,9 +38,7 @@ __all__ = [
     "CpuInfo",
     "GpuInfo",
     "Hardware",
-    "RateTracker",
     "SysMem",
-    "engine_metrics",
     "fetch",
     "fetch_json",
     "histogram",
@@ -970,24 +967,6 @@ def histogram(prom: dict[str, float] | None, name: str) -> dict[str, Any]:
     return result
 
 
-def engine_metrics(url: str | None, timeout: float = _DEFAULT_TIMEOUT) -> dict[str, float]:
-    """抓 llama-server 的 /metrics，剥掉 llamacpp: 前缀后返回 {指标名: 值}。
-
-    llama-server 暴露的名字带冒号（llamacpp:tokens_predicted_total），不是合法
-    Prometheus 命名，prometheus_client 的解析器不收，只能按文本解析。抓不到返回
-    空 dict（mock 引擎没有 /metrics 端点，属于正常情况）。
-    """
-    text = fetch(url, timeout=timeout)
-    if text is None:
-        return {}
-    prefix = "llamacpp:"
-    out: dict[str, float] = {}
-    for key, value in parse_prom(text).items():
-        if key.startswith(prefix):
-            out[key[len(prefix) :]] = value
-    return out
-
-
 def service_metrics(url: str | None, timeout: float = _DEFAULT_TIMEOUT) -> dict[str, Any]:
     """抓服务层 /metrics（标准 Prometheus 文本），摊平成面板要的形状。
 
@@ -1040,123 +1019,3 @@ def service_metrics(url: str | None, timeout: float = _DEFAULT_TIMEOUT) -> dict[
         "histograms": histograms,
         "raw": prom,
     }
-
-
-# ------------------------------------------------------------------ 吞吐差分
-
-
-def _counter_value(counters: dict[str, float] | None, name: str) -> float | None:
-    """从引擎指标 dict 里取一个累计计数器，取不到/非数字/非有限值都返回 None。"""
-    if not counters:
-        return None
-    try:
-        value = float(counters.get(name))  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None
-    return value if math.isfinite(value) else None
-
-
-def _round2(value: float | None) -> float | None:
-    return None if value is None else round(value, 2)
-
-
-class RateTracker:
-    """把引擎累计计数器差分成 tok/s（UI 每轮把新抓的 engine_metrics 喂进来）。
-
-    - instant：Δtokens / Δ(tokens_predicted_seconds_total)，与墙钟无关，是「单条
-      生成的真实速度」，并发时不会被摊薄；
-    - aggregate：Δtokens / Δ墙钟，多路并发时明显高于 instant，代表整机吞吐；
-    - window：instant 的 EWMA(0.6)，抹平两次采样之间的抖动，UI 的曲线用它。
-
-    最小采样间隔：脚本/手快时可能几十毫秒连打好几次，这种间隔里令牌数几乎不变，
-    差分出来是 0 或离谱的峰。所以墙钟 <0.5 s、生成秒 <0.1 s 的采样不推进基线，
-    直接沿用上一次的值——宁可多显示一轮旧值，也不要假的 0。
-    """
-
-    def __init__(
-        self,
-        *,
-        min_wall_gap: float = 0.5,
-        min_secs_gap: float = 0.1,
-        ewma_alpha: float = 0.6,
-        wall_clock: Callable[[], float] | None = None,
-    ) -> None:
-        self._lock = threading.Lock()
-        self._min_wall_gap = min_wall_gap
-        self._min_secs_gap = min_secs_gap
-        self._alpha = ewma_alpha
-        self._now = wall_clock or time.monotonic
-        self.reset()
-
-    def reset(self) -> None:
-        """清空基线（引擎重启/切换模型后调用）。"""
-        with self._lock:
-            self._tokens: float | None = None
-            self._secs: float | None = None
-            self._wall: float | None = None
-            self._wall_tokens: float | None = None
-            self._ewma: float | None = None
-            self._aggregate: float | None = None
-            self._instant: float | None = None
-
-    def update(self, counters: dict[str, float] | None) -> dict[str, float | None]:
-        """喂一次 engine_metrics 的输出，返回 {"instant","window","aggregate"}。
-
-        计数缺失（引擎没起 / mock 引擎）时 instant 为 None，window/aggregate
-        保留上一次的值；重复调用不会抛异常。
-        """
-        tokens = _counter_value(counters, "tokens_predicted_total")
-        secs = _counter_value(counters, "tokens_predicted_seconds_total")
-        with self._lock:
-            if tokens is not None:
-                try:
-                    self._advance(tokens, secs)
-                    instant = self._instant
-                except Exception:  # pragma: no cover - 采集层兜底
-                    instant = None
-            else:
-                instant = None
-            return {
-                "instant": _round2(instant),
-                "window": _round2(self._ewma),
-                "aggregate": _round2(self._aggregate),
-            }
-
-    def _advance(self, tokens: float, secs: float | None) -> None:
-        now = self._now()
-        # ---- 单条 decode 速度：Δtokens / Δ生成秒数
-        if secs is not None:
-            if self._tokens is None or self._secs is None:
-                self._tokens, self._secs = tokens, secs
-            else:
-                d_secs = secs - self._secs
-                d_tokens = tokens - self._tokens
-                if d_secs < 0 or d_tokens < 0:
-                    # 计数器回退 = 引擎重启；基线清零，等下个样本重新建立。
-                    self._tokens = self._secs = None
-                    self._instant = None
-                    self._ewma = None
-                elif d_secs >= self._min_secs_gap:
-                    instant = d_tokens / d_secs
-                    self._instant = instant
-                    if self._ewma is None:
-                        self._ewma = instant
-                    else:
-                        self._ewma = (
-                            self._ewma * (1.0 - self._alpha) + instant * self._alpha
-                        )
-                    self._tokens, self._secs = tokens, secs
-                # d_secs < min：基线不动，instant 沿用上一轮
-        # ---- 聚合吞吐：Δtokens / Δ墙钟
-        if self._wall is None or self._wall_tokens is None:
-            self._wall, self._wall_tokens = now, tokens
-            return
-        d_wall = now - self._wall
-        if d_wall < self._min_wall_gap:
-            return  # 间隔太短不推进基线，等下一次采样跨过 0.5 s
-        if tokens < self._wall_tokens:
-            self._wall, self._wall_tokens = now, tokens
-            self._aggregate = None
-            return
-        self._aggregate = (tokens - self._wall_tokens) / d_wall
-        self._wall, self._wall_tokens = now, tokens

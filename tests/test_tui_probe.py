@@ -17,14 +17,12 @@ from pathlib import Path
 
 import pytest
 
-from dshinfer.tui import probe
+from dshinfer.tui import live, probe
 from dshinfer.tui.probe import (
     CpuInfo,
     GpuInfo,
     Hardware,
-    RateTracker,
     SysMem,
-    engine_metrics,
     fetch,
     fetch_json,
     histogram,
@@ -226,21 +224,6 @@ def test_fetch_json_parses_and_degrades() -> None:
     assert fetch_json(None) is None
 
 
-def test_engine_metrics_strips_llamacpp_prefix() -> None:
-    with serve({"/metrics": (200, ENGINE_TEXT)}) as base:
-        metrics = engine_metrics(base + "/metrics")
-    assert metrics["tokens_predicted_total"] == 128.0
-    assert metrics["tokens_predicted_seconds_total"] == 4.5
-    assert metrics["kv_cache_usage_ratio"] == 0.42
-    assert all(not name.startswith("llamacpp:") for name in metrics)
-
-
-def test_engine_metrics_handles_missing_endpoint() -> None:
-    with serve({}) as base:
-        assert engine_metrics(base + "/metrics") == {}
-    assert engine_metrics(None) == {}
-
-
 def test_service_metrics_shapes_and_aggregation() -> None:
     with serve({"/metrics": (200, SERVICE_TEXT)}) as base:
         data = service_metrics(base + "/metrics")
@@ -269,99 +252,47 @@ def test_service_metrics_degrades_when_unreachable() -> None:
     assert data["histograms"] == {}
 
 
-# ----------------------------------------------------------------- RateTracker
+# ------------------------------------------------------ 吞吐差分（live.engine_rate）
 
 
-def _tracker() -> tuple[RateTracker, list[float]]:
-    clock = [1000.0]
-    return RateTracker(wall_clock=lambda: clock[0]), clock
+def test_engine_rate_instant_window_aggregate() -> None:
+    """单条 decode 速度用 Δtoken/Δ生成秒数，聚合吞吐用 Δtoken/Δ墙钟。"""
+    live.reset_rate()
+    first = live.engine_rate(0.0, 0.0, now=1000.0)
+    assert first["instant"] is None
 
-
-def test_rate_tracker_instant_window_aggregate() -> None:
-    tracker, clock = _tracker()
-    first = tracker.update(
-        {"tokens_predicted_total": 0.0, "tokens_predicted_seconds_total": 0.0}
-    )
-    assert first == {"instant": None, "window": None, "aggregate": None}
-
-    clock[0] += 1.0
-    second = tracker.update(
-        {"tokens_predicted_total": 120.0, "tokens_predicted_seconds_total": 2.0}
-    )
-    # Δtokens/Δ生成秒 = 120/2 = 60；Δtokens/Δ墙钟 = 120/1 = 120
+    second = live.engine_rate(120.0, 2.0, now=1001.0)
     assert second["instant"] == pytest.approx(60.0)
     assert second["window"] == pytest.approx(60.0)
     assert second["aggregate"] == pytest.approx(120.0)
 
-    clock[0] += 1.0
-    third = tracker.update(
-        {"tokens_predicted_total": 240.0, "tokens_predicted_seconds_total": 4.0}
-    )
+    third = live.engine_rate(240.0, 4.0, now=1002.0)
     assert third["instant"] == pytest.approx(60.0)
     assert third["aggregate"] == pytest.approx(120.0)
+    live.reset_rate()
 
 
-def test_rate_tracker_rejects_too_short_gaps() -> None:
-    tracker, clock = _tracker()
-    tracker.update({"tokens_predicted_total": 100.0, "tokens_predicted_seconds_total": 1.0})
-    clock[0] += 1.0
-    good = tracker.update(
-        {"tokens_predicted_total": 200.0, "tokens_predicted_seconds_total": 3.0}
-    )
+def test_engine_rate_ignores_too_short_gaps() -> None:
+    live.reset_rate()
+    live.engine_rate(100.0, 1.0, now=1000.0)
+    good = live.engine_rate(200.0, 3.0, now=1001.0)
     assert good["instant"] == pytest.approx(50.0)
 
-    # 0.05 s 内连打：令牌几乎不变，绝不能算出 0 或离谱的峰，而是沿用上一轮
-    for _ in range(3):
-        clock[0] += 0.05
-        spammed = tracker.update(
-            {"tokens_predicted_total": 201.0, "tokens_predicted_seconds_total": 3.001}
-        )
-        assert spammed["instant"] == pytest.approx(50.0)
-        assert spammed["window"] == pytest.approx(50.0)
-        assert spammed["aggregate"] == pytest.approx(100.0)
+    # 0.05 s 内连打：窗口太短算不出有意义的瞬时速度，这一轮不报数
+    # （面板保留上一次显示值），但也不能算出 0 或离谱的峰污染 EWMA。
+    spam = live.engine_rate(201.0, 3.001, now=1001.05)
+    assert spam["instant"] is None
+    assert spam["window"] == pytest.approx(50.0)
+    live.reset_rate()
 
 
-def test_rate_tracker_resets_on_counter_rollback() -> None:
-    tracker, clock = _tracker()
-    tracker.update({"tokens_predicted_total": 500.0, "tokens_predicted_seconds_total": 9.0})
-    clock[0] += 1.0
-    assert tracker.update(
-        {"tokens_predicted_total": 600.0, "tokens_predicted_seconds_total": 11.0}
-    )["instant"] == pytest.approx(50.0)
-
-    # 引擎重启：计数器回退，基线清空，这一轮不报数
-    clock[0] += 1.0
-    reset = tracker.update({"tokens_predicted_total": 3.0, "tokens_predicted_seconds_total": 0.2})
-    assert reset["instant"] is None
-    # 下一个样本重新建立基线，也还不报数，再下一个才恢复
-    clock[0] += 1.0
-    assert tracker.update(
-        {"tokens_predicted_total": 50.0, "tokens_predicted_seconds_total": 2.2}
-    )["instant"] is None
-    clock[0] += 1.0
-    assert tracker.update(
-        {"tokens_predicted_total": 150.0, "tokens_predicted_seconds_total": 4.2}
-    )["instant"] == pytest.approx(50.0)
-
-
-def test_rate_tracker_tolerates_missing_counters() -> None:
-    tracker, _ = _tracker()
-    empty = tracker.update(None)
-    assert empty == {"instant": None, "window": None, "aggregate": None}
-    assert tracker.update({})["instant"] is None
-    # 只有 tokens、没有生成秒数：instant 无法算，但不报错
-    assert tracker.update({"tokens_predicted_total": 5.0})["instant"] is None
-    tracker.reset()
-    assert tracker.update({"tokens_predicted_total": 1.0})["instant"] is None
-
-
-def test_rate_tracker_aggregate_survives_without_seconds() -> None:
-    tracker, clock = _tracker()
-    tracker.update({"tokens_predicted_total": 0.0})
-    clock[0] += 1.0
-    result = tracker.update({"tokens_predicted_total": 100.0})
-    assert result["instant"] is None
-    assert result["aggregate"] == pytest.approx(100.0)
+def test_engine_rate_resets_on_counter_rollback() -> None:
+    live.reset_rate()
+    live.engine_rate(500.0, 9.0, now=1000.0)
+    assert live.engine_rate(600.0, 11.0, now=1001.0)["instant"] == pytest.approx(50.0)
+    # 计数器回退（引擎重启）：这一轮不报数
+    assert live.engine_rate(3.0, 0.2, now=1002.0)["instant"] is None
+    live.reset_rate()
 
 
 # ------------------------------------------------------------------ 硬件采集
