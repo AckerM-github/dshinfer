@@ -134,7 +134,55 @@ bash scripts/fetch-model.sh --sums                      # 改了清单就重生�
 | `--download` 遇已存在且通过校验 | SKIP，exit 0 |
 | 未知参数 | exit 2 |
 
-## 6. 两个实现坑（记下来省得再踩）
+## 6. 一个 GGUF 元数据不自洽（2026-11-11，重要）
+
+Q4_K_M 那份文件（`mradermacher` 转的）头部写着：
+
+| 键 | 值 | 文件里实际 |
+|---|---|---|
+| `general.architecture` | `qwen35` | — |
+| `qwen35.block_count` | **33** | 只有 `blk.0`–`blk.31` 共 32 层，`blk.32.*` 张量 **0 个** |
+| `qwen35.nextn_predict_layers` | **1** | 没有 MTP 层张量 |
+| `qwen35.attention.recurrent_layers` | 长度 **33** | `[1,1,1,0]`×8 之后多一个 `0` |
+
+也就是说：**元数据在描述一个不存在的 MTP 层**。转换器把那一层的张量丢了，元数据没跟着改。
+
+后果分版本：
+
+| 引擎 | 行为 |
+|---|---|
+| 本仓库的 `llama-server`（build **12202** / `d6be06557`） | 容忍，照常加载运行 —— 所以两个月都没人发现 |
+| 上游 **`7d7f0287`**（2026-11-08，llama-cpp-python 0.3.36 自带） | 按元数据逐层找张量 → `llama_model_load: error loading model: check_tensor_dims: tensor 'blk.32.attn_norm.weight' not found` |
+
+0.3.35 同样失败，**不是绑定版本问题**。
+
+### 修复
+
+只改头部三个值，张量区一个字节不动：
+
+```
+qwen35.block_count              33 → 32
+qwen35.nextn_predict_layers      1 → 0
+qwen35.attention.recurrent_layers  截断到 32 个元素
+```
+
+脚本：`D:\dshworkspace\_wheel\gguf_rewrite.py`（第一版用"原地补丁"把数组头写坏，
+加载器在读 KV 时死循环；改成整体字节流重排后正常）。
+数据区起点仍是 `10970080`，427 个张量的 offset 全部不变。
+
+### 验证（修复是无损的）
+
+| 项 | 结果 |
+|---|---|
+| 进程内加载 | 3.7–4.0 s |
+| 贪婪 32 token，进程内（修复件 + 新版 llama.cpp） vs llama-server（原件 + build 12202） | **逐字符完全相同** |
+| 修复件启动 llama-server | 正常，41.5 tok/s |
+| 原件备份 | `_orig/DeepSeek-...Q4_K_M.orig.gguf` |
+
+**为什么要做**：MTP 层的权重本来就不在文件里，32 层的权重一个没少，所以"删掉不存在的层"只是让元数据说真话。
+`registry.py` 读出来的 `n_layers` 现在是 32（原来是 33，也是错的）。
+
+## 7. 两个实现坑（记下来省得再踩）
 
 1. **别用 TAB 当 `read` 的字段分隔符**：TAB 属于 IFS 空白，`read` 会把连续分隔符折叠成一个，
    于是空的 `url` 字段被吞掉、`note` 顶到 `url` 位上（第一版就撞了，`--download` 把 note 当 URL 去 GET）。

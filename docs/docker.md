@@ -699,3 +699,31 @@ NVIDIA 的 apt 仓库按架构分目录（`stable/deb/amd64`），与发行版 c
 去掉所有手工挂载后的实测：`ops.sh up` **12 s** 就绪、32K 显存 **6,001 MiB**、`ops.sh check` **7/7 通过**；
 64K（只用基础 compose，不带覆盖层）短 prompt **34–35 t/s**、显存 **6,737 MiB**、容器内 `nvidia-smi` 可用（运行时注入）。
 
+## 17. 引擎选择：原生默认 `inproc`，容器强制 `llamacpp`（2026-11-11）
+
+起因：Windows 侧新增了进程内引擎（`vendor/llama_cpp` → `llama.dll`），并把 `config/base.env` 的默认值改成 `inproc`。
+容器里跑不了它，所以 `config/docker.env` 显式覆盖回 `llamacpp`。
+
+| 项 | 原生（Windows） | 容器（Linux） |
+|---|---|---|
+| 默认引擎 | `inproc`（`base.env`） | `llamacpp`（`docker.env` 覆盖，后读到的赢） |
+| 为什么 | 进程内省 20–30 ms；单人对话够用 | 镜像里没有 `vendor/`，也没有 Linux 版 `libllama.so`；`/opt/llama/bin/llama-server` 才是可用路径 |
+| 并发 | **1**（一个 context 一次只能一个 decode） | 4 slot + `kv_unified` |
+| 实测 | 首字 0.9 s、~41.5 tok/s、重复前缀 `cached=18/19` | 非流式 1.50 s、流式 42 帧、32K/4 slot |
+
+容器内强开 `DSHINFER_ENGINE=inproc` 的实测报错（取证用）：
+
+```text
+EngineError: import llama_cpp 失败：需要 vendor/llama_cpp 或 pip install llama-cpp-python
+```
+
+要让容器也用进程内引擎，需要三件事一起做（目前没做）：
+
+1. 镜像里 `COPY vendor/ /app/vendor/`，并把 `/app` 加进 `PYTHONPATH`；
+2. 用与 vendor 绑定同源的 llama.cpp（`7d7f0287`）编出 Linux 版 `libllama.so`，放进 `/opt/llama/lib`；
+3. `docker.env` 设 `DSHINFER_INPROC_LIB_DIR=/opt/llama/lib` 并删掉 `DSHINFER_ENGINE=llamacpp` 这行。
+
+风险：第 2 步的 `.so` 版本必须和 vendor 的 `llama.h` 对得上，否则就是 Windows 侧踩过的
+`no backends are loaded` / `access violation`（见 `docs/models.md` §6 与本节 16.3）。
+
+

@@ -66,6 +66,25 @@ def _default_llama_server_path() -> str:
     return "/opt/llama/bin/llama-server"
 
 
+def _default_inproc_lib_dir() -> str:
+    """进程内引擎用的 DLL 目录（llama.dll / ggml-cuda.dll / cublas*）。
+
+    这一套必须和 vendor/llama_cpp 的版本对得上：0.3.36 绑定对应 llama.cpp
+    `7d7f0287`，而 `D:\\llm\\runtime\\llama.cpp` 里那份是 build 12202 —— 两者
+    ABI 不兼容（实测 `no backends are loaded` + 加载后 `access violation`），
+    所以不能混用。空字符串 = 让 llama_cpp 用包内 `lib/` 或 `LLAMA_CPP_LIB_PATH`。
+    """
+    if _IS_WINDOWS:
+        for candidate in (
+            r"D:\llm\runtime\llama-inproc\bin",
+            r"D:\dshworkspace\_wheel\y\bin",
+        ):
+            if Path(candidate).is_dir():
+                return candidate
+        return r"D:\llm\runtime\llama-inproc\bin"
+    return ""
+
+
 def _default_engine_log_path() -> str:
     if _IS_WINDOWS:
         return r"D:\llm\runtime\llama-server.log"
@@ -153,6 +172,12 @@ class Settings(BaseSettings):
     engine_port: int = 8124
     engine_log_path: str = _default_engine_log_path()
     engine_start_timeout_s: float = 180.0
+
+    # ---- 进程内引擎（DSHINFER_ENGINE=inproc）----
+    # 用 llama-cpp-python 的 ctypes 绑定在**同一个进程**里驱动 llama.dll：
+    # 省 20–30 ms/请求，KV 与 batch 全部可见；代价是并发退化到 1（一个 context
+    # 一次只能一个 decode），且 C 层崩溃会带走整个服务。
+    inproc_lib_dir: str = _default_inproc_lib_dir()
 
     # ---- 并发与背压 ----
     # 服务层同时在飞的上限。必须 ≤ n_parallel，否则请求会排在调度器里等一个

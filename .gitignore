@@ -15,6 +15,11 @@ __pycache__/
 *.gguf.part
 *.gguf.part.bad
 
+# vendor 里的二进制（DLL 放 D:\llm\runtime\llama-inproc\bin，不进 git）
+vendor/**/*.dll
+vendor/**/*.lib
+vendor/**/bin/
+
 # Generated artifacts
 eval/results/
 eval/latest.json

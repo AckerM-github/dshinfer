@@ -4,10 +4,18 @@
 而是把「一个模型怎么变成线上服务」这件事的每一层都摊开：协议、并发、背压、流式、取消、观测。
 
 ```
-HTTP (FastAPI)  ──►  Service（准入/排队/超时/取消/埋点）──►  Engine（协议）──►  Mock / llama.cpp
+HTTP (FastAPI)  ──►  Service（准入/排队/超时/取消/埋点）──►  Engine（协议）──►  Mock / inproc / llama-server
        ▲                                                                          │
        └────────────────────── SSE / JSON ◄── TokenEvent ◄────────────────────────┘
 ```
+
+三种引擎，同一套服务层：
+
+| `ENGINE` | 实现 | 进程模型 | 并发 | 前缀缓存 | 用在 |
+|---|---|---|---|---|---|
+| `inproc`（默认） | `vendor/llama_cpp` → `llama.dll` | 同进程 | **1** | 只记得上一条 | 单人对话、要低延迟 |
+| `llamacpp` | `llama-server.exe` 子进程 | 跨进程 | 4 slot | 4 条会话各留一份（87–97% 命中） | 多会话、要吞吐；容器里只有它 |
+| `mock` | 纯 Python 假引擎 | 同进程 | 按配置 | 无 | 测试、压测、CI |
 
 ## 分层与职责
 
@@ -67,14 +75,15 @@ curl.exe -s -X POST http://127.0.0.1:8000/v1/chat/completions `
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `ENGINE` | `mock` | `mock` 或 `llamacpp`（真模型） |
+| `ENGINE` | `inproc` | `inproc`（进程内 `vendor/llama_cpp`，并发 1）/ `llamacpp`（子进程 4 slot）/ `mock`（测试） |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | 监听地址 |
 | `MAX_CONCURRENCY` | `4` | 同时在飞的请求上限（必须 ≤ `N_PARALLEL`） |
 | `QUEUE_LIMIT` | `64` | 排队上限，超了直接 429（背压） |
 | `QUEUE_TIMEOUT_S` | `30` | 排队超时 |
 | `REQUEST_TIMEOUT_S` | `180` | 单请求生成总超时 |
 | `GGUF_PATH` | `D:\llm\models\gguf\...Q4_K_M.gguf` | 量化权重路径 |
-| `LLAMA_SERVER_PATH` | `D:\llm\runtime\llama.cpp\llama-server.exe` | 引擎可执行文件 |
+| `LLAMA_SERVER_PATH` | `D:\llm\runtime\llama.cpp\llama-server.exe` | 引擎可执行文件（`ENGINE=llamacpp`） |
+| `INPROC_LIB_DIR` | `D:\llm\runtime\llama-inproc\bin` | 进程内引擎的 DLL 目录（`ENGINE=inproc`），与 `vendor/llama_cpp` 同源 |
 | `ENGINE_PORT` | `8124` | 引擎子进程监听端口 |
 | `N_GPU_LAYERS` | `-1` | 全部层上 GPU |
 | `N_CTX` | `65536` | **所有槽位共享**的上下文总额；配合 `KV_UNIFIED` 时单请求可用满 |

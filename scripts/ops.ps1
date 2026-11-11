@@ -1,4 +1,4 @@
-﻿param(
+param(
     [Parameter(Position = 0)][string]$Command = 'help',
     [Parameter(Position = 1, ValueFromRemainingArguments = $true)][string[]]$Rest,
     [int]$Port = 8000,
@@ -83,8 +83,14 @@ function cmd_status {
     } else {
         Write-Host '  healthz    : no answer (service down?)'
     }
+    # engine process only exists for llamacpp; inproc runs inside the service process
+    $engName = if ($h) { [string]$h.engine.engine } else { '' }
     $eng = Get-Process -Name 'llama-server' -ErrorAction SilentlyContinue
-    if ($eng) {
+    if ($engName -like '*inproc*') {
+        $svc = Get-Process -Id $pids -ErrorAction SilentlyContinue | Select-Object -First 1
+        $mb = if ($svc) { [math]::Round($svc.WorkingSet64 / 1MB) } else { 0 }
+        Write-Host ("  engine     : in-process (service pid {0} rss {1} MiB)" -f (($pids) -join ','), $mb)
+    } elseif ($eng) {
         $mb = [math]::Round(($eng | Measure-Object -Property WorkingSet64 -Sum).Sum / 1MB)
         Write-Host ("  engine     : llama-server pid {0} rss {1} MiB" -f (($eng | ForEach-Object { $_.Id }) -join ','), $mb)
     } else {

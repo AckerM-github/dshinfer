@@ -5,9 +5,10 @@
 
 ---
 
-## 一、服务层源码 `src/dshinfer/`（27 文件 / 6,896 行）
+## 一、服务层源码 `src/dshinfer/`（28 文件 / 6,829 行）
 
-三组：核心服务层（12 个）、引擎适配层（6 个）、终端面板 `tui/`（9 个，只在 `--extra tui` 时装）。
+三组：核心服务层（13 个）、引擎适配层（6 个）、终端面板 `tui/`（9 个，只在 `--extra tui` 时装）。
+另有 `vendor/llama_cpp/`（15 文件 / 16,910 行，进程内引擎用的第三方拷贝，来源与规矩见 `vendor/README.md`）。
 
 | 文件 | 行 | 职责 | 状态 |
 |---|---:|---|---|
@@ -24,9 +25,10 @@
 | `main.py` | 23 | uvicorn 启动入口 | 完成 |
 | `registry.py` | 146 | 模型注册表：扫目录、缓存、默认模型、热发现 | 完成 |
 | `gguf.py` | 199 | GGUF 头解析（架构/层数/上下文/维度/MoE），自写以便不依赖 llama.cpp | 完成 |
-| `engine/__init__.py` | 28 | `build_engine()` 工厂（mock / llama-server） | 完成 |
-| `engine/base.py` | 69 | `Engine` 协议 + `GenRequest`/`TokenEvent`/`Usage` | 完成 |
-| `engine/llamacpp_server.py` | 260 | 子进程生命周期、启动参数（含 `-fit off`）、`/completion` 流解析、孤儿进程清理、`timings` 回读 | 完成 |
+| `engine/__init__.py` | 32 | `build_engine()` 工厂（mock / inproc / llama-server） | 完成 |
+| `engine/base.py` | 59 | `Engine` 协议 + `GenRequest`/`TokenEvent`/`Usage` | 完成 |
+| `engine/llamacpp_server.py` | 231 | 子进程生命周期、启动参数（含 `-fit off`）、`/completion` 流解析、孤儿进程清理、`timings` 回读 | 完成 |
+| `engine/inproc.py` | 268 | 进程内引擎：`vendor/llama_cpp` → `llama.dll`；`threading.Lock` 串成并发 1、`create_completion(stream=True)`、前缀复用与 `cached_tokens` 自算 | 完成，默认引擎 |
 | `engine/manager.py` | 136 | 模型状态机 idle→loading→ready、互斥加载、热切换 | 完成 |
 | `engine/mock.py` | 79 | 假引擎（无模型也能跑通全链路） | 完成 |
 | `tui/__init__.py` | 25 | 面板模块分工与导出 | 完成 |

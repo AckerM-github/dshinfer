@@ -25,4 +25,8 @@ def build_engine(settings: Settings, gguf_path: str | None = None) -> Engine:
         from .llamacpp_server import LlamaServerEngine
 
         return LlamaServerEngine(settings, gguf_path=gguf_path)
+    if settings.engine in ("inproc", "llama.cpp-inproc"):
+        from .inproc import InprocEngine
+
+        return InprocEngine(settings, gguf_path=gguf_path)
     raise EngineError(f"未知引擎: {settings.engine}")

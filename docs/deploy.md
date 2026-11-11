@@ -15,7 +15,7 @@
 | | A：Windows 原生 | B：本机容器 / 云 | 备注 |
 |---|---|---|---|
 | 服务层进程 | `.venv\Scripts\python.exe -m dshinfer.main` | `/opt/venv/bin/python -m dshinfer.main`（容器内） | 同一份 `src/` |
-| 引擎 | `D:\llm\runtime\llama.cpp\llama-server.exe`（子进程） | `/opt/llama/bin/llama-server`（子进程） | 都是「服务层拉起引擎」，只是路径不同 |
+| 引擎 | 默认 `inproc`：进程内 `vendor/llama_cpp` → `llama.dll`（并发 1）；`ENGINE=llamacpp` 才拉 `D:\llm\runtime\llama.cpp\llama-server.exe` | `/opt/llama/bin/llama-server`（子进程，4 slot） | 引擎是接口，换实现不动服务层；容器里 `docker.env` 强制回 `llamacpp` |
 | GPU 供给 | 宿主驱动 + `ggml-cuda.dll` | nvidia-container-toolkit 注入 `libcuda.so.1` | 唯一无法消除的差异，收敛在 compose 硬件段 |
 | 权重 | `D:\llm\models\gguf` | `/models`（只读 bind 或卷） | 5.2 GB 不进镜像 |
 | 日志 | `D:\llm\runtime\*.log` | `/var/log/dshinfer`（named volume） | |
