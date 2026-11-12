@@ -187,6 +187,68 @@ async def test_tool_call_stream(tool_client):
     assert json.loads(calls[0]["function"]["arguments"]) == {"city": "杭州"}
 
 
+THINKING_TOOL_TEXT = "先想一想</think>\n\n" + TOOL_CALL_TEXT
+
+
+@pytest.fixture
+async def thinking_tool_client():
+    app = create_app(_settings(mock_response=THINKING_TOOL_TEXT, enable_thinking=True))
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            yield c
+
+
+async def test_thinking_with_tools_stream_keeps_reasoning_out_of_content(thinking_tool_client):
+    """开思考 + 带工具：推理段只能走 reasoning_content，正文里不能混进 </think>。"""
+    async with thinking_tool_client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "杭州天气"}],
+            "tools": TOOLS,
+            "stream": True,
+            "max_tokens": 200,
+        },
+    ) as r:
+        lines = [line async for line in r.aiter_lines() if line.startswith("data: ")]
+
+    reasoning, text, calls, finish = "", "", [], None
+    for raw in lines:
+        p = raw[6:]
+        if p.strip() == "[DONE]":
+            break
+        chunk = json.loads(p)
+        for ch in chunk["choices"]:
+            delta = ch.get("delta") or {}
+            reasoning += delta.get("reasoning_content") or ""
+            text += delta.get("content") or ""
+            calls.extend(delta.get("tool_calls") or [])
+            finish = ch.get("finish_reason") or finish
+    assert reasoning.strip() == "先想一想"
+    assert "</think>" not in text
+    assert "先想一想" not in text
+    assert text.strip() == "好的，我查一下。"
+    assert finish == "tool_calls"
+    assert calls[0]["function"]["name"] == "get_weather"
+
+
+async def test_thinking_with_tools_non_stream(thinking_tool_client):
+    r = await thinking_tool_client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "杭州天气"}],
+            "tools": TOOLS,
+            "max_tokens": 200,
+        },
+    )
+    choice = r.json()["choices"][0]
+    message = choice["message"]
+    assert message["reasoning_content"] == "先想一想"
+    assert message["content"] == "好的，我查一下。"
+    assert choice["finish_reason"] == "tool_calls"
+
+
 async def test_tool_choice_none_disables_tools(tool_client):
     """tool_choice="none" 时不该把工具段拼进提示词。"""
     svc = ChatService(MockEngine(_settings()), _settings())

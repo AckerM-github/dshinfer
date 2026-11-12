@@ -35,7 +35,9 @@ log = structlog.get_logger()
 __all__ = ["ChatService", "QueueFull", "Prepared", "render_prompt"]
 
 # "<tool_call" 的长度减一：工具标记可能横跨 chunk，先扣住这么多字符不吐
-_TAIL_HOLD = 9
+# 10 = len("<tool_call>") - 1：保证任何部分匹配的标记都还留在未发出的尾巴里，
+# 否则前缀被当成正文吐出去后，尾部拼不回来，parse_tool_calls 会漏掉这个调用。
+_TAIL_HOLD = 10
 
 
 def _new_id() -> str:
@@ -328,6 +330,7 @@ class ChatService:
 
         tool_mode = bool(prep.tools)
         buf: list[str] = []
+        body_parts: list[str] = []
         splitter = ThinkSplitter(self.s.enable_thinking)
         emitted = 0
         pending_finish: str | None = None
@@ -353,33 +356,40 @@ class ChatService:
                         completion_tokens += 1
                         if tool_mode:
                             # 带工具时必须先攒着：`<tool_call>` 可能横跨多个 chunk，
-                            # 只能先放出去 9 个字符之前的部分，剩下的等确定不是工具块再吐。
+                            # 只能先放出去尾巴之前的部分，剩下的等确定不是工具块再吐。
+                            # 发之前还要过 ThinkSplitter：开思考时推理段属于
+                            # reasoning_content，不能当正文流出去。
                             buf.append(ev.text)
                             joined = "".join(buf)
                             cut = joined.find("<tool_call>")
                             if cut < 0:
                                 cut = max(len(joined) - _TAIL_HOLD, 0)
                             if cut > emitted:
-                                piece = joined[emitted:cut]
+                                for kind, piece in splitter.feed(joined[emitted:cut]):
+                                    if not piece:
+                                        continue
+                                    if first_token_at is None:
+                                        first_token_at = time.perf_counter()
+                                        TTFT.observe(first_token_at - started)
+                                        if tr is not None:
+                                            tr.mark("first_token")
+                                    if kind == "content":
+                                        body_parts.append(piece)
+                                    delta = (
+                                        {"reasoning_content": piece}
+                                        if kind == "reasoning"
+                                        else {"content": piece}
+                                    )
+                                    yield {
+                                        "id": cid,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model,
+                                        "choices": [
+                                            {"index": 0, "delta": delta, "finish_reason": None}
+                                        ],
+                                    }
                                 emitted = cut
-                                if first_token_at is None:
-                                    first_token_at = time.perf_counter()
-                                    TTFT.observe(first_token_at - started)
-                                    if tr is not None:
-                                        tr.mark("first_token")
-                                yield {
-                                    "id": cid,
-                                    "object": "chat.completion.chunk",
-                                    "created": created,
-                                    "model": model,
-                                    "choices": [
-                                        {
-                                            "index": 0,
-                                            "delta": {"content": piece},
-                                            "finish_reason": None,
-                                        }
-                                    ],
-                                }
                         else:
                             for kind, piece in splitter.feed(ev.text):
                                 if not piece:
@@ -408,40 +418,27 @@ class ChatService:
 
             if tool_mode:
                 joined = "".join(buf)
-                parts = splitter.feed(joined) + splitter.flush()
-                reasoning_text = "".join(p for k, p in parts if k == "reasoning")
-                body = "".join(p for k, p in parts if k == "content")
-                if reasoning_text:
+                tail = joined[emitted:]
+                cut_tool = tail.find("<tool_call>")
+                visible_tail = tail if cut_tool < 0 else tail[:cut_tool]
+                for kind, piece in [*splitter.feed(visible_tail), *splitter.flush()]:
+                    if not piece:
+                        continue
+                    if kind == "content":
+                        body_parts.append(piece)
+                    delta = (
+                        {"reasoning_content": piece} if kind == "reasoning" else {"content": piece}
+                    )
                     yield {
                         "id": cid,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"reasoning_content": reasoning_text},
-                                "finish_reason": None,
-                            }
-                        ],
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
                     }
-                cut = body.find("<tool_call>")
-                if cut < 0:
-                    cut = len(body)
-                if cut > emitted:
-                    yield {
-                        "id": cid,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": body[emitted:cut]},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
+                body = "".join(body_parts)
+                if cut_tool >= 0:
+                    body += tail[cut_tool:]
                 _, tool_calls = parse_tool_calls(body)
                 if tool_calls:
                     yield {
